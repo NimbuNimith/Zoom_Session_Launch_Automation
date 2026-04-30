@@ -38,7 +38,7 @@ IF ERRORLEVEL 1 (
 echo.
 echo ============================================
 echo   Setup Complete!
-echo   Run the app with:  python zoom_command_center.py
+echo   Run the app with:  python Zoom_Ai.py
 echo   Or double-click:   run_app.bat
 echo ============================================
 pause
