@@ -20,7 +20,6 @@ A desktop automation tool for managing multiple Zoom sessions simultaneously —
 
 - Windows 10 / 11
 - Python 3.9 or higher → [Download here](https://python.org/downloads)
-  - ⚠️ During install, check **"Add Python to PATH"**
 
 ---
 
