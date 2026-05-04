@@ -374,26 +374,26 @@ async def launch_browser_task(url, data, mode="HOST"):
         if mode == "HOST" and len(email) > 3:
             app.update_status(url, "🔑 Logging in...", "...")
             try:
-                await page.goto("https://zoom.us/signin", timeout=90000, wait_until='domcontentloaded')
+                await page.goto("https://zoom.us/signin", timeout=100000, wait_until='domcontentloaded')
                 if "profile" in page.url:
                     print("   ✅ Already logged in!")
                 else:
-                    await page.click("input[name='email'], #email", timeout=10000)
+                    await page.click("input[name='email'], #email", timeout=100000)
                     await asyncio.sleep(0.5)
                     await page.fill("input[name='email'], #email", email)
                     
                     for attempt in range(3):
-                        try: await page.click("button:has-text('Next')", timeout=3000)
+                        try: await page.click("button:has-text('Next')", timeout=100000)
                         except: pass
                         try:
-                            await page.wait_for_selector("input[name='password'], #password", state="visible", timeout=3000)
+                            await page.wait_for_selector("input[name='password'], #password", state="visible", timeout=100000)
                             break
                         except: await asyncio.sleep(2)
                     
-                    await page.wait_for_selector("input[name='password'], #password", state="visible", timeout=10000)
+                    await page.wait_for_selector("input[name='password'], #password", state="visible", timeout=100000)
                     await page.fill("input[name='password'], #password", password)
-                    await page.click("button:has-text('Sign In'), button:has-text('Sign in')", timeout=5000)
-                    await page.wait_for_url("**/profile", timeout=30000, wait_until='domcontentloaded')
+                    await page.click("button:has-text('Sign In'), button:has-text('Sign in')", timeout=100000)
+                    await page.wait_for_url("**/profile", timeout=100000, wait_until='domcontentloaded')
                     print("   ✅ Login Success")
             except Exception as e:
                 print(f"   ⚠️ Login Failed for {bot_name}: {e}")
