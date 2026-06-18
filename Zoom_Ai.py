@@ -8,6 +8,87 @@ import random
 from datetime import datetime
 from playwright.async_api import async_playwright
 import re
+import sys
+import os
+import subprocess
+
+# ─────────────────────────────────────────────
+# AUTO-UPDATER
+# ─────────────────────────────────────────────
+CURRENT_VERSION = "1.0.0"
+VERSION_URL  = "https://raw.githubusercontent.com/NimbuNimith/Zoom_Session_Launch_Automation/main/version.txt"
+DOWNLOAD_URL = "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/latest/download/Zoom_Ai_latest.exe"
+
+def _do_update(new_version):
+    """Downloads the new exe and writes a .bat to replace + relaunch, then exits."""
+    current_exe = sys.executable if getattr(sys, "frozen", False) else None
+    if not current_exe:
+        # Running as a plain .py — just inform, no self-replace needed
+        messagebox.showinfo(
+            "Update Available",
+            f"Version {new_version} is available.\n\n"
+            "Download the latest release from GitHub and replace this file."
+        )
+        return
+
+    new_exe_path = current_exe + ".new"
+    try:
+        import requests
+        messagebox.showinfo(
+            "Downloading Update",
+            f"Downloading v{new_version}...\nThe app will restart automatically when done."
+        )
+        r = requests.get(DOWNLOAD_URL, stream=True, timeout=60)
+        r.raise_for_status()
+        with open(new_exe_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+    except Exception as e:
+        messagebox.showerror("Update Failed", f"Could not download update:\n{e}")
+        return
+
+    # Write a small .bat: waits for this process to exit, replaces the exe,
+    # relaunches it, then deletes itself.
+    bat_path = current_exe + "_updater.bat"
+    bat = (
+        "@echo off\n"
+        "timeout /t 2 /nobreak > nul\n"
+        f'move /y "{new_exe_path}" "{current_exe}"\n'
+        f'start "" "{current_exe}"\n'
+        'del "%~f0"\n'
+    )
+    with open(bat_path, "w") as f:
+        f.write(bat)
+
+    subprocess.Popen(bat_path, shell=True)
+    sys.exit(0)
+
+
+def check_for_update():
+    """
+    Runs in a background thread at startup.
+    Silently skips if offline or version check fails — never blocks the app.
+    """
+    try:
+        import requests
+        from packaging import version as pkg_version
+        resp = requests.get(VERSION_URL, timeout=5)
+        resp.raise_for_status()
+        latest = resp.text.strip()
+        if pkg_version.parse(latest) > pkg_version.parse(CURRENT_VERSION):
+            # Must touch Tkinter from the main thread only
+            def _prompt():
+                if messagebox.askyesno(
+                    "Update Available",
+                    f"A new version is available: v{latest}\n"
+                    f"You have: v{CURRENT_VERSION}\n\n"
+                    "Download and restart now?"
+                ):
+                    _do_update(latest)
+            root.after(1000, _prompt)
+    except Exception:
+        pass  # Offline or GitHub unreachable — fail silently
+
 
 # --- CONFIGURATION ---
 MAX_SESSIONS_PER_ACCOUNT = 2  # Set to 1 if you only have a Basic/Pro license
@@ -377,7 +458,7 @@ async def launch_browser_task(url, data, mode="HOST"):
                 await page.goto("https://zoom.us/signin", timeout=100000, wait_until='domcontentloaded')
                 if "profile" in page.url:
                     print("   ✅ Already logged in!")
-                else:
+                else: 
                     await page.click("input[name='email'], #email", timeout=100000)
                     await asyncio.sleep(0.5)
                     await page.fill("input[name='email'], #email", email)
@@ -455,4 +536,6 @@ async def monitoring_heartbeat():
 if __name__ == "__main__":
     root = tk.Tk()
     app = ZoomControlApp(root)
+    # Check for updates in background — never blocks startup
+    threading.Thread(target=check_for_update, daemon=True).start()
     root.mainloop()
