@@ -69,7 +69,7 @@ _COHOST_RE = re.compile(r"^(.*?)\s*\(\s*Co-?host\b", re.IGNORECASE)
 # these rows doesn't reliably match an exact-text assumption across Zoom
 # web-client builds.
 _MORE_BTN_SEL = (
-    "button:has-text('More'), "
+    "button:has-text('More'):not([aria-label*='participants' i]), "
     "[aria-label='More'], [aria-label*='More button']"
 )
 _POLLS_MENU_ITEM_SEL = (
@@ -1313,6 +1313,30 @@ async def get_zoom_participant_info(page, scan_names: bool = True):
 # polls, and nothing here touches session launch / participant
 # monitoring / end-session logic.
 
+_POLLS_LABEL_RE = re.compile(r"^\s*Polls\s*$")
+
+
+async def _visible_polls_control(page):
+    """A VISIBLE control that opens the Polls panel, or None.
+
+    Zoom shows Polls either as a direct toolbar button or as a tile inside
+    the 'More' menu, depending on window width and which side panels are
+    open — and the same page can flip between the two. Taking '.first' of a
+    plain selector match can land on an invisible copy (a collapsed
+    toolbar item) and then wait forever for something that will never show,
+    so only visible matches are considered: the structured selectors first,
+    then any visible element whose whole text is exactly 'Polls' (clicking
+    that label bubbles up to its button/tile)."""
+    for loc in (page.locator(_POLLS_MENU_ITEM_SEL), page.get_by_text(_POLLS_LABEL_RE)):
+        try:
+            visible = loc.filter(visible=True)
+            if await visible.count() > 0:
+                return visible.first
+        except Exception:
+            continue
+    return None
+
+
 async def _open_polls_panel(page):
     """Drive Participants → More → Polls to reveal the Polls/Quizzes
     panel. Idempotent — if the panel is already open, returns
@@ -1330,37 +1354,44 @@ async def _open_polls_panel(page):
     # panel are in a known state).
     await _ensure_participants_panel_open(page)
 
-    polls_item = page.locator(_POLLS_MENU_ITEM_SEL)
+    # If a visible Polls control already exists — either a direct toolbar
+    # button (wide layouts) or the tile of a "More" menu left open by a
+    # previous failed attempt — use it as-is. More is a *toggle*, so
+    # clicking it again here would close the menu instead of opening it.
+    polls_item = await _visible_polls_control(page)
 
-    # If the "More" dropdown is already open (e.g. left over from a
-    # previous failed attempt), the Polls row will already be visible.
-    # More is a *toggle* button — clicking it again in that case would
-    # close the menu instead of opening it, breaking automatic retry.
-    # So: only click More if the menu isn't already showing Polls.
-    menu_already_open = False
-    try:
-        if await polls_item.count() > 0 and await polls_item.first.is_visible(timeout=800):
-            menu_already_open = True
-    except Exception:
-        pass
-
-    if not menu_already_open:
-        # Step 2: More (three-dot menu)
-        more_btn = page.locator(_MORE_BTN_SEL)
-        if await more_btn.count() == 0 or not await more_btn.first.is_visible(timeout=2000):
+    if polls_item is None:
+        # Step 2: More (three-dot menu). Only VISIBLE matches count, and the
+        # Participants side panel has its own "More" button
+        # (aria-label "More managing participants options") that
+        # _MORE_BTN_SEL deliberately excludes.
+        more_btn = page.locator(_MORE_BTN_SEL).filter(visible=True)
+        if await more_btn.count() == 0:
             raise RuntimeError("'More' button not found or not visible")
         await more_btn.first.click(force=True)
         await asyncio.sleep(1)
 
-        try:
-            await polls_item.first.wait_for(state="visible", timeout=3000)
-        except Exception:
-            raise RuntimeError("'Polls' item never appeared in the More menu after clicking More")
+        for _ in range(6):
+            polls_item = await _visible_polls_control(page)
+            if polls_item is not None:
+                break
+            await asyncio.sleep(0.5)
+        if polls_item is None:
+            # Say what was actually on the page, so the next failure explains
+            # itself instead of needing a DevTools session to diagnose.
+            try:
+                structured = await page.locator(_POLLS_MENU_ITEM_SEL).count()
+                text_hits = await page.get_by_text(_POLLS_LABEL_RE).count()
+                more_visible = await page.locator(_MORE_BTN_SEL).filter(visible=True).count()
+            except Exception:
+                structured = text_hits = more_visible = -1
+            raise RuntimeError(
+                "'Polls' item never appeared in the More menu after clicking More "
+                f"(none visible; selector matches: {structured}, exact 'Polls' text "
+                f"elements: {text_hits}, visible More buttons: {more_visible})")
 
     # Step 3: Polls
-    if await polls_item.count() == 0:
-        raise RuntimeError("'Polls' menu item not found")
-    await polls_item.first.click(force=True)
+    await polls_item.click(force=True)
     await asyncio.sleep(1)
 
     try:
