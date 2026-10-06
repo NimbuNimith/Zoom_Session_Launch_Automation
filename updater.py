@@ -27,7 +27,7 @@ import subprocess
 import requests
 from PySide6.QtCore import QTimer
 
-CURRENT_VERSION = "2.1.17"
+CURRENT_VERSION = "2.2.0"
 VERSION_URL  = "https://raw.githubusercontent.com/NimbuNimith/Zoom_Session_Launch_Automation/main/version.txt"
 DOWNLOAD_URL = "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/latest/download/Zoom_Ai_latest.exe"
 

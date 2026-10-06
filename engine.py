@@ -1055,6 +1055,7 @@ class Engine:
                                                launched_at=_now_hhmmss(), poll_action=poll_action)
                         if m.is_prism() and not m.prism_status_pushed:
                             asyncio.create_task(self._push_prism_status(m.join_url, m))
+                        asyncio.create_task(self._scan_available_polls(m.join_url))
                 except Exception:
                     pass
 
@@ -1081,7 +1082,10 @@ class Engine:
                 async with self._page_lock_for(url):
                     await _open_polls_panel(m.page)
                     polls = await _list_available_polls(m.page)
-                names = [title for title, _ in polls]
+                # The "Default (End Session Poll)" dropdown entry already
+                # covers the default poll, so don't list it a second time.
+                names = [title for title, _ in polls
+                         if title.casefold() != DEFAULT_POLL_NAME.casefold()]
                 break
             except Exception as e:
                 if attempt == 2:
@@ -1430,13 +1434,38 @@ async def _get_question_count(title_loc) -> int | None:
 
 
 async def _list_available_polls(page) -> list[tuple[str, int | None]]:
-    """Not implemented yet: the row-container selector for the Polls/Quizzes
-    panel has to be confirmed against a live panel first (nothing in this
-    codebase enumerates poll titles today). Until it lands,
-    Engine._scan_available_polls is intentionally not hooked into the LIVE
-    transition, so the per-row dropdown stays empty and nothing opens the
-    Polls panel unprompted."""
-    raise NotImplementedError("poll enumeration selector not yet verified live")
+    """Every Poll-type (never Quiz-type) entry in the already-open
+    Polls/Quizzes panel, as [(title, question_count_or_None), ...] in panel
+    order, de-duplicated case-insensitively (same matching rule
+    _find_poll_row launches by). The caller opens the panel first.
+
+    Confirmed live 2026-10-06 against a real Zoom web-client panel: each
+    entry's title is <div class="poll-list-item__topic-name"> and sits
+    exactly 4 levels below its <div class="poll-list-item"> row — the same
+    "ancestor::*[4]" depth _is_quiz_entry/_get_question_count already rely
+    on, so those two are reused untouched rather than re-implemented here.
+    Best-effort: any failure returns what was found so far, never raises."""
+    found: list[tuple[str, int | None]] = []
+    seen: set[str] = set()
+    try:
+        titles = page.locator(".poll-list-item__topic-name")
+        n = await titles.count()
+    except Exception:
+        return found
+    for i in range(n):
+        t = titles.nth(i)
+        try:
+            title = (await t.inner_text(timeout=1500)).strip()
+            if not title or await _is_quiz_entry(t):
+                continue
+            key = title.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append((title, await _get_question_count(t)))
+        except Exception:
+            continue
+    return found
 
 
 async def _find_poll_row(page, poll_name: str, is_prism: bool = False):
