@@ -1066,32 +1066,47 @@ class Engine:
         A failed scan leaves the dropdown as it was (Default only on a first
         scan); manual and Auto-Pilot launches keep working either way.
 
-        Waits briefly first (the End/Leave button that flips LIVE appears
-        before the whole toolbar is necessarily interactive) and tries a
-        second time if the first attempt raises. An EMPTY result is not
-        retried — a meeting with no polls is a legitimate answer."""
+        Waits before each look (the End/Leave button that flips LIVE
+        appears before the whole toolbar is necessarily interactive) and
+        looks up to len(POLL_SCAN_DELAYS) times: an attempt that raises, or
+        that finds NO polls at all, is retried later — a real meeting almost
+        always lists at least End Session Poll, so a completely empty list
+        usually means the panel hadn't finished rendering. A list that holds
+        only the default poll is a real answer and is accepted straight
+        away. The Polls panel is closed again after every look."""
         m = self.model.get(url)
         if not m: return
-        names = None
-        for attempt in (1, 2):
-            await asyncio.sleep(3 if attempt == 1 else 15)
+        polls = None
+        last_error = None
+        for delay in POLL_SCAN_DELAYS:
+            await asyncio.sleep(delay)
             m = self.model.get(url)
             if not m or not m.page or m.page.is_closed():
                 return
             try:
                 async with self._page_lock_for(url):
-                    await _open_polls_panel(m.page)
-                    polls = await _list_available_polls(m.page)
-                # The "Default (End Session Poll)" dropdown entry already
-                # covers the default poll, so don't list it a second time.
-                names = [title for title, _ in polls
-                         if title.casefold() != DEFAULT_POLL_NAME.casefold()]
-                break
+                    try:
+                        await _open_polls_panel(m.page)
+                        found = await _list_available_polls(m.page)
+                    finally:
+                        await _close_polls_panel(m.page)
+                last_error = None
+                if found:
+                    polls = found
+                    break
             except Exception as e:
-                if attempt == 2:
-                    self.log(f"Poll scan failed for '{m.session_name}' — dropdown unchanged: {e}", "warn")
-        if names is None:
+                last_error = e
+        if polls is None:
+            if last_error is not None:
+                self.log(f"Poll scan failed for '{m.session_name}' — dropdown unchanged: {last_error}", "warn")
+            else:
+                self.log(f"Poll scan for '{m.session_name}': no polls found after "
+                         f"{len(POLL_SCAN_DELAYS)} checks — dropdown unchanged.", "info")
             return
+        # The "Default (End Session Poll)" dropdown entry already covers the
+        # default poll, so don't list it a second time.
+        names = [title for title, _ in polls
+                 if title.casefold() != DEFAULT_POLL_NAME.casefold()]
         # A selection that's no longer in the meeting's poll list must not
         # linger invisibly (Auto-Pilot would still try to launch it) — drop
         # back to Default and say so.
@@ -1100,7 +1115,8 @@ class Engine:
                      f"reverting to {DEFAULT_POLL_NAME}.", "warn")
             self.model.set_fields(url, selected_poll="")
         self.model.set_fields(url, available_polls=names)
-        self.log(f"Found {len(names)} poll(s) for '{m.session_name}'.", "info")
+        self.log(f"Poll scan for '{m.session_name}': {len(polls)} poll(s) in the meeting "
+                 f"({', '.join(t for t, _ in polls)}); dropdown offers {len(names)} besides the default.", "info")
 
     async def _status_text_loop(self):
         """Every 6s. Body-text poll for Waiting/Ended/stuck states, kept
@@ -1315,6 +1331,33 @@ async def get_zoom_participant_info(page, scan_names: bool = True):
 
 _POLLS_LABEL_RE = re.compile(r"^\s*Polls\s*$")
 
+# Poll scan timing (Engine._scan_available_polls / _list_available_polls).
+POLL_SCAN_DELAYS = (3, 10, 20)      # seconds to wait before each of up to 3 looks
+POLL_ROWS_WAIT_SECONDS = 6.0        # how long one look waits for poll rows to render
+
+
+async def _close_polls_panel(page) -> bool:
+    """Close the floating Polls/Quizzes window. Best-effort — never raises;
+    returns True if it's gone (or wasn't open) afterwards.
+
+    Confirmed live 2026-10-06: the panel is a ReactModal window,
+    <div aria-label="Polls/Quizzes"> holding exactly one
+    <button class="window-close common-window-close" aria-label="Close">.
+    Closing it and reopening it through Polls afterwards both work."""
+    try:
+        close_btn = page.locator(
+            "[aria-label='Polls/Quizzes'] button.common-window-close").filter(visible=True)
+        if await close_btn.count() == 0:
+            return True
+        await close_btn.first.click(force=True)
+        for _ in range(8):
+            await asyncio.sleep(0.25)
+            if await page.locator("[aria-label='Polls/Quizzes']").filter(visible=True).count() == 0:
+                return True
+        return False
+    except Exception:
+        return False
+
 
 async def _visible_polls_control(page):
     """A VISIBLE control that opens the Polls panel, or None.
@@ -1480,7 +1523,19 @@ async def _list_available_polls(page) -> list[tuple[str, int | None]]:
     seen: set[str] = set()
     try:
         titles = page.locator(".poll-list-item__topic-name")
-        n = await titles.count()
+        # Rows render a moment after the panel's title does (~0.25 s on a
+        # quiet machine, measured live; longer when many windows are busy)
+        # — wait for them to show up and stop growing instead of reading
+        # an empty list too early.
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + POLL_ROWS_WAIT_SECONDS
+        n = prev = await titles.count()
+        while loop.time() < deadline:
+            await asyncio.sleep(0.4)
+            n = await titles.count()
+            if n > 0 and n == prev:
+                break
+            prev = n
     except Exception:
         return found
     for i in range(n):
