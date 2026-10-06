@@ -13,7 +13,7 @@
 ; it needs is already inside it.
 
 #define MyAppName "Zoom + Prism Command Center"
-#define MyAppVersion "2.2.2"
+#define MyAppVersion "2.2.3"
 #define MyAppPublisher "upGrad Education"
 #define MyAppExeName "Zoom_Ai_latest.exe"
 
@@ -77,3 +77,7 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} now"; \
 ; reinstall doesn't find a stale .bat/.new file sitting in {app}.
 Type: files; Name: "{app}\*_updater.bat"
 Type: files; Name: "{app}\*.new"
+; The app copies Chromium here once so it runs from a fixed path (keeps
+; Windows Firewall from prompting on every launch). ~390 MB — don't leave
+; it behind on uninstall.
+Type: filesandordirs; Name: "{localappdata}\Command Center\chromium"

@@ -28,10 +28,12 @@ import asyncio
 import os
 import random
 import re
+import sys
 
 from playwright.async_api import async_playwright
 
 from models import SessionModel, SessionTableModel
+from paths import ensure_stable_chromium, stable_chromium_exe_for
 from prism_status_push import push_prism_live_status_async
 
 MAX_SESSIONS_PER_ACCOUNT = 2
@@ -197,10 +199,41 @@ class Engine:
             note = resolved if resolved else "<unset — expected; Chromium is bundled, frozen-mode default applies>"
             self.log(f"Starting browser engine — PLAYWRIGHT_BROWSERS_PATH = {note}", "info")
             self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(
-                headless=False,
-                args=["--deny-permission-prompts", "--window-size=1200,800"],
-            )
+            launch_args = ["--deny-permission-prompts", "--window-size=1200,800"]
+
+            # Frozen builds only: run Chromium from a fixed folder instead of
+            # the per-launch %TEMP%\_MEIxxxxxx one, so Windows Firewall sees
+            # the same program every time and asks at most once (see
+            # paths.stable_chromium_dir). Any failure falls back to the
+            # bundled copy — worse (the prompt returns), never fatal.
+            stable_exe = None
+            if getattr(sys, "frozen", False):
+                bundled = self._playwright.chromium.executable_path
+                if not os.path.isfile(stable_chromium_exe_for(bundled)):
+                    self.log("Preparing the browser (first launch after an install or "
+                             "update only — this takes a moment)...", "info")
+                stable_exe, why = await asyncio.to_thread(ensure_stable_chromium, bundled)
+                if stable_exe:
+                    self.log(f"Browser runs from a fixed location (Windows Firewall will "
+                             f"only ask once): {stable_exe}", "info")
+                else:
+                    self.log(f"Could not set up the fixed browser location ({why}) — using the "
+                             f"bundled browser (Windows may ask about the firewall again).", "warn")
+
+            try:
+                if stable_exe:
+                    self._browser = await self._playwright.chromium.launch(
+                        headless=False, args=launch_args, executable_path=stable_exe)
+                else:
+                    self._browser = await self._playwright.chromium.launch(
+                        headless=False, args=launch_args)
+            except Exception as e:
+                if not stable_exe:
+                    raise
+                self.log(f"Fixed-location browser failed to start ({e}) — retrying with "
+                         f"the bundled browser.", "warn")
+                self._browser = await self._playwright.chromium.launch(
+                    headless=False, args=launch_args)
         except Exception as e:
             self.log(
                 f"❌ Failed to start the browser engine: {e}. Sessions cannot "
@@ -1507,6 +1540,29 @@ async def _get_question_count(title_loc) -> int | None:
     return None
 
 
+async def _wait_for_poll_rows(page) -> int:
+    """Wait for the Polls/Quizzes list to finish rendering; returns how many
+    rows are there (0 if none appeared within POLL_ROWS_WAIT_SECONDS).
+
+    Rows render a moment AFTER the panel's own title does (~0.25 s on a quiet
+    machine, measured live; noticeably longer when many browser windows are
+    busy), so reading the list the instant the title is visible sees it
+    empty. That was behind both an empty dropdown scan and a poll launch
+    that failed on attempt 1 and only succeeded on the retry. "Done" means
+    at least one row and the same count on two consecutive checks."""
+    titles = page.locator(".poll-list-item__topic-name")
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + POLL_ROWS_WAIT_SECONDS
+    n = prev = await titles.count()
+    while loop.time() < deadline:
+        await asyncio.sleep(0.4)
+        n = await titles.count()
+        if n > 0 and n == prev:
+            break
+        prev = n
+    return n
+
+
 async def _list_available_polls(page) -> list[tuple[str, int | None]]:
     """Every Poll-type (never Quiz-type) entry in the already-open
     Polls/Quizzes panel, as [(title, question_count_or_None), ...] in panel
@@ -1523,19 +1579,7 @@ async def _list_available_polls(page) -> list[tuple[str, int | None]]:
     seen: set[str] = set()
     try:
         titles = page.locator(".poll-list-item__topic-name")
-        # Rows render a moment after the panel's title does (~0.25 s on a
-        # quiet machine, measured live; longer when many windows are busy)
-        # — wait for them to show up and stop growing instead of reading
-        # an empty list too early.
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + POLL_ROWS_WAIT_SECONDS
-        n = prev = await titles.count()
-        while loop.time() < deadline:
-            await asyncio.sleep(0.4)
-            n = await titles.count()
-            if n > 0 and n == prev:
-                break
-            prev = n
+        n = await _wait_for_poll_rows(page)
     except Exception:
         return found
     for i in range(n):
@@ -1577,6 +1621,9 @@ async def _find_poll_row(page, poll_name: str, is_prism: bool = False):
     exactly what caused a past mis-launch)."""
     pattern = re.compile(rf"^\s*{re.escape(poll_name)}\s*$", re.IGNORECASE)
     try:
+        # The list renders after the panel's title; matching before it has
+        # finished makes the first attempt see "no such poll".
+        await _wait_for_poll_rows(page)
         candidates = page.get_by_text(pattern)
         n = await candidates.count()
     except Exception:
@@ -1665,7 +1712,14 @@ async def _do_launch_poll_once(page, poll_name: str, is_prism: bool = False):
 
     row = await _find_poll_row(page, poll_name, is_prism=is_prism)
     if row is None:
-        raise RuntimeError(f"Poll '{poll_name}' was not found in the list")
+        # Say what the panel actually showed, so a failure explains itself.
+        try:
+            present = [t.strip() for t in await page.locator(".poll-list-item__topic-name").all_inner_texts()]
+        except Exception:
+            present = []
+        raise RuntimeError(
+            f"Poll '{poll_name}' was not found in the list "
+            f"(entries in the panel: {present if present else 'none'})")
 
     await _click_launch_on_row(page, row)  # raises on failure/ambiguity
 
