@@ -148,7 +148,46 @@ class GSheetsAPIClient:
             raise GSheetsError(data.get('error', 'UNKNOWN'), data.get('message', ''), resp.status_code)
         
         return data.get('moderators', [])
-    
+
+    def fetch_token(self) -> str:
+        """
+        Fetch the Prism API bearer token from the sheet's Config tab, via
+        the Apps Script's `action=token` branch, so the token doesn't have
+        to live in the app's code.
+
+        Returns:
+            The token string (never empty)
+
+        Raises:
+            GSheetsError: network/HTTP failure, non-JSON reply, the script
+            reporting failure (e.g. Config tab missing or the cell empty),
+            or a script that hasn't been updated with the token branch yet
+            (it then falls through to the default session lookup and
+            answers MISSING_PARAMS).
+        """
+        try:
+            resp = self.session.get(self.base_url, params={'action': 'token'}, timeout=self.timeout)
+        except requests.Timeout:
+            raise GSheetsError('TIMEOUT', f'Request timed out after {self.timeout}s', 408)
+        except requests.RequestException as e:
+            raise GSheetsError('NETWORK_ERROR', f'Network error: {e}', 0)
+
+        if resp.status_code != 200:
+            raise GSheetsError('HTTP_ERROR', f'Status {resp.status_code}', resp.status_code)
+
+        try:
+            data = resp.json()
+        except ValueError:
+            raise GSheetsError('INVALID_JSON', 'Response is not valid JSON', resp.status_code)
+
+        if not data.get('success'):
+            raise GSheetsError(data.get('error', 'UNKNOWN'), data.get('message', ''), resp.status_code)
+
+        token = str(data.get('token') or '').strip()
+        if not token:
+            raise GSheetsError('EMPTY_TOKEN', 'The script returned success but no token', resp.status_code)
+        return token
+
     def _normalize_session(self, raw: Dict[str, Any]) -> Dict[str, str]:
         """Ensure all CSV_FORMAT.md columns exist with string values."""
         csv_columns = [

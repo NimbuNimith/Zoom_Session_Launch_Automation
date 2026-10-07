@@ -20,31 +20,35 @@ returned by the liveSessions query (see prism_data_pull.py) — it is NOT the
 `LS Type` / `Session Type` field from the old export, which is just a
 display category like "Live" or "lecture".
 
-Credentials: this module reads PRISM_BEARER_TOKEN from prism_config.py,
-which checks the env var first and falls back to a value pasted directly
-into that file. See prism_config.py for why it's git-ignored — short
-version: this repo is public, don't commit a real token to it.
+Credentials: this module reads the token via prism_token.get_cached_token()
+— loaded from the Google Sheet's Config tab at startup, falling back to
+PRISM_BEARER_TOKEN in prism_config.py (env var first, else a value pasted
+into that file) if the Sheet can't be reached. See prism_config.py for why
+it's git-ignored — short version: this repo is public, don't commit a real
+token to it.
 """
 
 import os
 import asyncio
 import requests
 
-from prism_config import PRISM_BEARER_TOKEN
+from prism_token import get_cached_token
 
 PRISM_GRAPHQL_URL = "https://lxp-api.upgrad.com/graphql"
 
 
 def _headers(role: str = "delivery-manager"):
-    if not PRISM_BEARER_TOKEN:
+    token = get_cached_token()
+    if not token:
         raise RuntimeError(
-            "No Prism bearer token found. Set PRISM_BEARER_TOKEN as an env "
-            "var, or paste it into prism_config.py."
+            "No Prism bearer token found. It's normally loaded from the Google "
+            "Sheet's Config tab at startup — check the Event Log for why that "
+            "failed — or set PRISM_BEARER_TOKEN as an env var."
         )
     return {
         "accept": "*/*",
         "content-type": "application/json",
-        "authorization": f"Bearer {PRISM_BEARER_TOKEN}",
+        "authorization": f"Bearer {token}",
         "apollographql-client-name": "prism-frontend",
         "apollographql-client-version": "1.0",
         "role": role,

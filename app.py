@@ -64,6 +64,7 @@ qasync_patch.patch()
 from main_window import MainWindow
 from updater import check_for_update
 from paths import resource_path
+from prism_token import refresh_token
 from single_instance import try_acquire_or_notify_existing, wire_activation_to_window
 from splash import show_splash
 
@@ -120,6 +121,10 @@ def main():
     asyncio.set_event_loop(loop)
 
     with loop:
+        # Fire-and-forget, like the engine start: loads the Prism token from
+        # the Google Sheet and logs the outcome. It never raises, and falls
+        # back to the built-in token if the Sheet can't be reached.
+        loop.create_task(refresh_token(log_fn=window.log_event))
         loop.create_task(window.engine.start())
         loop.run_forever()
 

@@ -39,7 +39,7 @@ import asyncio
 import requests
 from openpyxl import load_workbook
 
-from prism_config import PRISM_BEARER_TOKEN
+from prism_token import get_cached_token
 
 PRISM_GRAPHQL_URL = "https://lxp-api.upgrad.com/graphql"
 
@@ -75,16 +75,18 @@ OUTPUT_COLUMNS = ["Session Name", "Starts At", "Ends At", "Status",
 
 
 def _headers():
-    if not PRISM_BEARER_TOKEN:
+    token = get_cached_token()
+    if not token:
         raise RuntimeError(
-            "No Prism bearer token found. Set PRISM_BEARER_TOKEN as an env "
-            "var, or paste it into prism_config.py."
+            "No Prism bearer token found. It's normally loaded from the Google "
+            "Sheet's Config tab at startup — check the Event Log for why that "
+            "failed — or set PRISM_BEARER_TOKEN as an env var."
         )
     return {
         "accept": "*/*",
         "apollographql-client-name": "prism-frontend",
         "apollographql-client-version": "1.0",
-        "authorization": f"Bearer {PRISM_BEARER_TOKEN}",
+        "authorization": f"Bearer {token}",
         "content-type": "application/json",
         "role": "delivery-manager",
     }
