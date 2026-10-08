@@ -173,6 +173,101 @@ def notify(parent, title: str, message: str):
     dlg.exec()
 
 
+def _fmt_mb(n: float) -> str:
+    return f"{n / (1024 * 1024):.0f} MB"
+
+
+def _fmt_eta(seconds: float) -> str:
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"about {max(seconds, 1)} s left"
+    minutes, secs = divmod(seconds, 60)
+    return f"about {minutes} min {secs:02d} s left"
+
+
+class UpdateProgressDialog(QDialog):
+    """Shown while an app update downloads (see updater.py). Same look as
+    _StyledDialog, but it has to stay alive and be updated while the
+    download runs, which _StyledDialog's build-once layout can't do.
+
+    Closing it any way other than finish() — the Cancel button, the window's
+    X, Esc — counts as cancelling the download."""
+
+    cancel_requested = Signal()
+
+    def __init__(self, parent, new_version: str):
+        super().__init__(parent)
+        self._finished = False
+        self.setWindowTitle("Downloading Update")
+        self.setWindowIcon(_app_icon())
+        self.setMinimumWidth(420)
+        self.setModal(True)
+        self.setStyleSheet(theme.STYLESHEET)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 18, 20, 16)
+        v.setSpacing(12)
+
+        title_lbl = QLabel(f"Downloading v{new_version}")
+        title_lbl.setStyleSheet(f"font-size: 13px; font-weight: 700; color: {theme.INK};")
+        v.addWidget(title_lbl)
+
+        msg_lbl = QLabel("The app will restart automatically when the download finishes.")
+        msg_lbl.setWordWrap(True)
+        msg_lbl.setStyleSheet(f"font-size: 11px; color: {theme.MUTED};")
+        v.addWidget(msg_lbl)
+
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setValue(0)
+        self.bar.setFixedHeight(6)
+        self.bar.setTextVisible(False)
+        v.addWidget(self.bar)
+
+        self.detail = QLabel("Starting download...")
+        self.detail.setStyleSheet(
+            f"font-family: {theme.FONT_MONO}; font-size: 11px; color: {theme.MUTED};")
+        v.addWidget(self.detail)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.setObjectName("ToolBtn")
+        self.btn_cancel.setCursor(Qt.PointingHandCursor)
+        self.btn_cancel.clicked.connect(self.reject)
+        row.addWidget(self.btn_cancel)
+        v.addLayout(row)
+
+    @Slot(object, object, float)
+    def set_progress(self, done, total, speed):
+        if total:
+            self.bar.setRange(0, 1000)
+            self.bar.setValue(min(1000, int(done * 1000 / total)))
+            text = f"{_fmt_mb(done)} of {_fmt_mb(total)}  ·  {int(done * 100 / total)}%"
+            if speed > 0:
+                text += f"  ·  {speed / (1024 * 1024):.1f} MB/s"
+                if done < total:
+                    text += f"  ·  {_fmt_eta((total - done) / speed)}"
+        else:
+            self.bar.setRange(0, 0)   # size unknown: indeterminate
+            text = f"{_fmt_mb(done)} downloaded"
+            if speed > 0:
+                text += f"  ·  {speed / (1024 * 1024):.1f} MB/s"
+        self.detail.setText(text)
+
+    def finish(self):
+        """Close without it counting as a cancel."""
+        self._finished = True
+        self.accept()
+
+    def reject(self):
+        if not self._finished:
+            self._finished = True
+            self.detail.setText("Cancelling...")
+            self.cancel_requested.emit()
+        super().reject()
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Add Session dialog
 # ─────────────────────────────────────────────────────────────────────────

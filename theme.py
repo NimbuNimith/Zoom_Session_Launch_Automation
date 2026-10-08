@@ -319,6 +319,15 @@ QPushButton#ToolBtn:hover {{ background: {SURFACE_RAISED}; border-color: {MUTED}
 QPushButton#ToolBtn:pressed {{ background: {BG}; }}
 QPushButton#ToolBtn:disabled {{ color: {MUTED}; border-color: {LINE}; }}
 
+/* Progress bars (update download, Google Sheets sync). Green = good/in
+   progress, same meaning as the rest of the palette. */
+QProgressBar {{
+    background: {SURFACE_RAISED};
+    border: none;
+    border-radius: 3px;
+}}
+QProgressBar::chunk {{ background: {GREEN}; border-radius: 3px; }}
+
 QLabel#CountBadge {{
     color: {MUTED};
     font-family: {FONT_MONO};
