@@ -1,0 +1,25 @@
+# Secrets / credentials — never commit
+prism_config.py
+roster.xlsx
+sample_sessions.csv
+
+# Internal notes and templates
+archive/
+CODE_REVIEW.md
+APPS_SCRIPT_TEMPLATE.js
+
+# Build output (the .exe is ~435 MB — over GitHub's 100 MB file limit; it ships as a Release asset)
+dist/
+build/
+Output/
+*.exe
+*.zip
+
+# Python / tooling
+__pycache__/
+*.pyc
+.claude/
+
+# Local diagnostics
+probe_*.png
+*.log
