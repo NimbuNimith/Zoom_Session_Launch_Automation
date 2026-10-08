@@ -22,12 +22,13 @@ Release -> update version.txt).
 
 import os
 import sys
-import subprocess
 
 import requests
 from PySide6.QtCore import QTimer
 
-CURRENT_VERSION = "2.3.1"
+from update_swap import write_swap_script, launch_swap_script
+
+CURRENT_VERSION = "2.3.2"
 VERSION_URL  = "https://raw.githubusercontent.com/NimbuNimith/Zoom_Session_Launch_Automation/main/version.txt"
 DOWNLOAD_URL = "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/latest/download/Zoom_Ai_latest.exe"
 
@@ -45,25 +46,39 @@ def _do_update(parent, new_version: str):
         return
 
     new_exe_path = current_exe + ".new"
+    part_path = new_exe_path + ".part"
     try:
         notify(parent, "Downloading Update",
                f"Downloading v{new_version}...\nThe app will restart automatically when done.")
         r = requests.get(DOWNLOAD_URL, stream=True, timeout=60)
         r.raise_for_status()
-        with open(new_exe_path, "wb") as f:
+        expected = int(r.headers.get("Content-Length") or 0)
+        received = 0
+        # Written to .part and only renamed to .new once complete, so a
+        # dropped connection can never leave something that looks like a
+        # finished download.
+        with open(part_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
+                received += len(chunk)
+        if expected and received != expected:
+            raise IOError(f"download incomplete ({received} of {expected} bytes)")
+        with open(part_path, "rb") as f:
+            if f.read(2) != b"MZ":
+                raise IOError("downloaded file is not a Windows program")
+        os.replace(part_path, new_exe_path)
     except Exception as e:
+        try:
+            os.remove(part_path)
+        except OSError:
+            pass
         notify(parent, "Update Failed", f"Could not download update:\n{e}")
         return
 
-    bat_path = current_exe + "_updater.bat"
-    bat = ("@echo off\n" "timeout /t 2 /nobreak > nul\n"
-           f'move /y "{new_exe_path}" "{current_exe}"\n'
-           f'start "" "{current_exe}"\n' 'del "%~f0"\n')
-    with open(bat_path, "w") as f:
-        f.write(bat)
-    subprocess.Popen(bat_path, shell=True)
+    # The swap script (and why it retries and clears PyInstaller's env vars)
+    # lives in update_swap.py.
+    bat_path = write_swap_script(current_exe, new_exe_path)
+
     # NOT sys.exit(0) — that exits the interpreter immediately and skips
     # MainWindow.closeEvent() entirely, which is where the "sessions are
     # LIVE, are you sure?" confirmation lives, along with the only code
@@ -73,7 +88,18 @@ def _do_update(parent, new_version: str):
     # did before closeEvent()/the 8s safety-net thread were added —
     # this reuses that same, already-tested shutdown path instead of
     # bypassing it.
-    parent.close()
+    #
+    # close() returns False when the user declines the "sessions are
+    # live" prompt; the script is only started once the close is
+    # accepted, so declining leaves nothing running (the downloaded .new
+    # stays and the update is offered again next start).
+    if parent.close():
+        launch_swap_script(bat_path)
+    else:
+        try:
+            os.remove(bat_path)
+        except OSError:
+            pass
 
 
 def check_for_update(parent):
