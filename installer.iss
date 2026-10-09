@@ -13,7 +13,7 @@
 ; it needs is already inside it.
 
 #define MyAppName "Zoom + Prism Command Center"
-#define MyAppVersion "2.4.0"
+#define MyAppVersion "2.4.2"
 #define MyAppPublisher "upGrad Education"
 #define MyAppExeName "Zoom_Ai_latest.exe"
 

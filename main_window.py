@@ -42,6 +42,7 @@ from models import SessionModel, SessionTableModel, COL_INDEX
 from engine import Engine, DEFAULT_POLL_NAME, AUTO_POLL_END_MINUTES
 from prism_data_pull import fetch_sessions_async
 from paths import resource_path
+from hard_exit import hard_exit
 from applog import log_to_file, LOG_DIR
 from app_settings import get_settings
 from gsheets_api_client import GSheetsAPIClient, GSheetsError
@@ -863,8 +864,12 @@ class MainWindow(QMainWindow):
         #
         # 8s budget = the 5s graceful-shutdown timeout below + buffer
         # for quit() itself and normal interpreter teardown.
+        #
+        # hard_exit(), not os._exit(): os._exit crashed pyside6.abi3.dll
+        # when it fired while the main thread was still closing the event
+        # loop (see hard_exit.py).
         threading.Thread(
-            target=lambda: (_time.sleep(8), os._exit(0)), daemon=True
+            target=lambda: (_time.sleep(8), hard_exit(0)), daemon=True
         ).start()
         asyncio.ensure_future(self._shutdown_and_quit())
 
@@ -889,7 +894,7 @@ class MainWindow(QMainWindow):
             # wait around for the safety-net thread to bail us out — we
             # already know the clean path failed.
             print(f"quit() failed: {e}")
-            os._exit(0)
+            hard_exit(0)
 
     # ── UI construction ──────────────────────────────────────────────
     def _build_ui(self):
