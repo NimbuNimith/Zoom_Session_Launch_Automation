@@ -141,6 +141,45 @@ def build_launch_url(mid: str, raw_url: str, mode: str = "start") -> str:
     return base + ("?" + "&".join(params) if params else "")
 
 
+_SIGNIN_SKIP_SEL = ("button:has-text('Skip for now'), a:has-text('Skip for now'), "
+                    "[role='button']:has-text('Skip for now')")
+
+
+async def _skip_signin_interstitial(page) -> bool:
+    """Zoom sometimes inserts a "Sign in faster with your face, fingerprint,
+    or PIN" page (.../signin#/login/bind-passkey) after a correct password.
+    It offers [Next] (create a passkey) and [Skip for now and sign in]; with
+    no one clicking, the sign-in never finishes. Confirmed live 2026-10-09:
+    the first login for each of two accounts stopped there (launch failed),
+    and a manual Retry got through. Clicks "Skip for now" if it is on screen.
+    Returns True if it clicked something."""
+    try:
+        btn = page.locator(_SIGNIN_SKIP_SEL).filter(visible=True).first
+        if await btn.count() == 0:
+            return False
+        await btn.click(timeout=5000)
+        return True
+    except Exception:
+        return False
+
+
+async def _wait_until_signed_in(page, log, timeout: float = 60.0) -> bool:
+    """After submitting the password: wait until the page has left the
+    zoom.us/signin area, skipping the passkey offer if it appears. True once
+    signed in, False if still stuck on a sign-in step after `timeout`."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if "/signin" not in page.url.lower():
+            return True
+        if await _skip_signin_interstitial(page):
+            log("Zoom offered to set up a passkey — skipped it.", "info")
+            await asyncio.sleep(1.5)
+            continue
+        await asyncio.sleep(0.5)
+    return "/signin" not in page.url.lower()
+
+
 async def _block_zoom_protocol(route):
     # Registered with the route pattern "zoommtg://**" (see call sites),
     # so this only ever fires for that one protocol — every normal
@@ -510,7 +549,10 @@ class Engine:
                         # not the plain email form either — the
                         # automation has no logic for it, so surface it
                         # explicitly rather than misreading it as either.
-                        raise RuntimeError(f"stuck on an unhandled sign-in step at {page.url}")
+                        if await _wait_until_signed_in(page, self.log, timeout=30.0):
+                            already_logged_in = True
+                        else:
+                            raise RuntimeError(f"stuck on an unhandled sign-in step at {page.url}")
 
                     if already_logged_in:
                         self.log(f"Already logged in: {email} (at {page.url})", "ok")
@@ -564,9 +606,12 @@ class Engine:
                             raise RuntimeError(
                                 f"still on the password entry page after submitting — stuck at {page.url}")
                         if "/signin" in page.url.lower():
-                            raise RuntimeError(
-                                f"password form is gone but still stuck somewhere in Zoom's "
-                                f"sign-in flow (e.g. a passkey/verification step) at {page.url}")
+                            # The passkey offer is skipped here; anything else
+                            # still counts as stuck once the wait runs out.
+                            if not await _wait_until_signed_in(page, self.log, timeout=60.0):
+                                raise RuntimeError(
+                                    f"password form is gone but still stuck somewhere in Zoom's "
+                                    f"sign-in flow (e.g. a verification step) at {page.url}")
                         self.log(f"Login success: {email} (landed at {page.url})", "ok")
                 except Exception as e:
                     # Diagnostic capture — a generic "Login failed" line
