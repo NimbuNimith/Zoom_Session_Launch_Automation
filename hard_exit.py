@@ -67,7 +67,15 @@ def hard_exit(code: int = 0, sync_settings: bool = False):
     if sys.platform == "win32":
         try:
             import ctypes
-            kernel32 = ctypes.windll.kernel32
+            from ctypes import wintypes
+            # argtypes/restype are required: GetCurrentProcess() returns the
+            # pseudo-handle -1, and with ctypes' default 32-bit int handling it
+            # reached TerminateProcess as an invalid handle, so the call quietly
+            # failed and the os._exit fallback below crashed exactly as before.
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            kernel32.TerminateProcess.restype = wintypes.BOOL
             kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code)
         except Exception:
             pass
