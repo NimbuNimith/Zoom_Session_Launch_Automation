@@ -34,7 +34,7 @@ from PySide6.QtCore import QObject, QTimer, Signal, Slot
 from downloader import download_file, friendly_error, DownloadCancelled
 from update_swap import write_swap_script, launch_swap_script
 
-CURRENT_VERSION = "2.5.1"
+CURRENT_VERSION = "2.5.2"
 VERSION_URL  = "https://raw.githubusercontent.com/NimbuNimith/Zoom_Session_Launch_Automation/main/version.txt"
 DOWNLOAD_URL = "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/latest/download/Zoom_Ai_latest.exe"
 

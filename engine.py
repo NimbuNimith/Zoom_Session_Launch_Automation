@@ -180,6 +180,22 @@ async def _wait_until_signed_in(page, log, timeout: float = 60.0) -> bool:
     return "/signin" not in page.url.lower()
 
 
+async def _save_failure_screenshot(page, folder: str, label: str) -> str:
+    """Screenshot of the meeting page when an automation step fails, saved in
+    the app's data folder (next to the logs folder), so a failure can be diagnosed from
+    what the page actually showed. Returns the path, or "" if it couldn't."""
+    try:
+        from applog import LOG_DIR
+        d = os.path.join(os.path.dirname(LOG_DIR), folder)
+        os.makedirs(d, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", label)[:40] or "session"
+        path = os.path.join(d, f"{safe}_{_now_hhmmss().replace(':', '-')}.png")
+        await page.screenshot(path=path, timeout=8000)
+        return path
+    except Exception:
+        return ""
+
+
 async def _block_zoom_protocol(route):
     # Registered with the route pattern "zoommtg://**" (see call sites),
     # so this only ever fires for that one protocol — every normal
@@ -1035,7 +1051,11 @@ class Engine:
 
         m.poll_launching = False
         self.model.set_fields(url, poll_status=f"{prefix}Failed", poll_action="Launch Poll")
-        self.log(f"{prefix}Poll launch failed for '{m.session_name}': {last_err}", "err")
+        detail = f"{prefix}Poll launch failed for '{m.session_name}': {last_err}"
+        shot = await _save_failure_screenshot(m.page, "poll_failures", m.session_name)
+        if shot:
+            detail += f" | screenshot: {shot}"
+        self.log(detail, "err")
         return False
 
     async def launch_poll_for_many(self, urls: list):
@@ -1453,6 +1473,41 @@ async def _visible_polls_control(page):
     return None
 
 
+async def _polls_panel_visible(page) -> bool:
+    """Is the Polls/Quizzes panel actually on screen? Only VISIBLE matches
+    count. The old check took `.first` of a plain text match, and Zoom can
+    keep an invisible copy of the same text earlier in the page; then an
+    open panel was treated as closed, 'Polls' was clicked again (it is a
+    toggle, so that CLOSED the panel) and the wait for it to appear failed:
+    "Polls/Quizzes panel did not open after clicking 'Polls'"."""
+    for sel in ("[aria-label='Polls/Quizzes']", _POLLS_PANEL_TITLE_SEL):
+        try:
+            if await page.locator(sel).filter(visible=True).count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _polls_debug(page) -> str:
+    """One line describing what the page looks like, appended to poll errors
+    so a failure explains itself."""
+    try:
+        info = await page.evaluate("""() => ({
+            vis: document.visibilityState,
+            size: innerWidth + 'x' + innerHeight,
+            dialogs: Array.from(document.querySelectorAll('[role=dialog],[aria-modal=true],.ReactModal__Content'))
+                .map(e => (e.getAttribute('aria-label') || e.className || e.tagName).toString().slice(0, 40)).slice(0, 6),
+        })""")
+        attached = await page.locator(_POLLS_PANEL_TITLE_SEL).count()
+        visible = await page.locator(_POLLS_PANEL_TITLE_SEL).filter(visible=True).count()
+        return (f"page {info.get('size')}, visibility={info.get('vis')}, "
+                f"'Polls/Quizzes' text matches: {attached} attached / {visible} visible, "
+                f"dialogs on page: {info.get('dialogs') or 'none'}")
+    except Exception as ex:
+        return f"(could not inspect the page: {type(ex).__name__})"
+
+
 async def _open_polls_panel(page):
     """Drive Participants → More → Polls to reveal the Polls/Quizzes
     panel. Idempotent — if the panel is already open, returns
@@ -1462,9 +1517,8 @@ async def _open_polls_panel(page):
     failed (More button missing, Polls item missing, panel never
     opened, etc.) so failures are actionable in the Event Log instead of
     one generic message."""
-    if await page.locator(_POLLS_PANEL_TITLE_SEL).count() > 0:
-        if await page.locator(_POLLS_PANEL_TITLE_SEL).first.is_visible(timeout=1000):
-            return
+    if await _polls_panel_visible(page):
+        return
 
     # Step 1: Participants (also ensures the meeting toolbar / side
     # panel are in a known state).
@@ -1510,10 +1564,14 @@ async def _open_polls_panel(page):
     await polls_item.click(force=True)
     await asyncio.sleep(1)
 
-    try:
-        await page.locator(_POLLS_PANEL_TITLE_SEL).first.wait_for(state="visible", timeout=5000)
-    except Exception:
-        raise RuntimeError("Polls/Quizzes panel did not open after clicking 'Polls'")
+    # Up to ~9 s in total: a busy machine / many open meeting windows can
+    # make the panel appear well after the click.
+    for _ in range(32):
+        if await _polls_panel_visible(page):
+            return
+        await asyncio.sleep(0.25)
+    raise RuntimeError("Polls/Quizzes panel did not open after clicking 'Polls' — "
+                       + await _polls_debug(page))
 
 
 async def _is_quiz_entry(title_loc) -> bool:
@@ -1716,7 +1774,18 @@ async def _click_launch_on_row(page, title_loc) -> bool:
     own row into a container spanning multiple rows, and the fallback
     then clicked an unrelated poll's Launch button ('Academic writing
     session' launched instead of 'End Session Poll')."""
-    await title_loc.scroll_into_view_if_needed(timeout=2000)
+    try:
+        await title_loc.scroll_into_view_if_needed(timeout=2000)
+    except Exception:
+        # Playwright waits for the element to hold still between two frames;
+        # a row that keeps re-rendering (or a page that is slow to paint)
+        # never does, and a poll launch failed with "waiting for element to be
+        # stable" even though the row was right there. Scrolling it into view
+        # directly needs no such wait, and the hover/click below are forced.
+        try:
+            await title_loc.evaluate("el => el.scrollIntoView({block: 'center', inline: 'nearest'})")
+        except Exception:
+            pass
     await title_loc.hover(force=True)
     await asyncio.sleep(0.5)
 
