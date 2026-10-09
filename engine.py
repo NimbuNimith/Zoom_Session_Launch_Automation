@@ -33,7 +33,7 @@ import sys
 from playwright.async_api import async_playwright
 
 from models import SessionModel, SessionTableModel
-from paths import ensure_stable_chromium, stable_chromium_exe_for
+from browser_setup import required_revision, browser_exe_path, remove_other_revisions
 from prism_status_push import push_prism_live_status_async
 
 MAX_SESSIONS_PER_ACCOUNT = 2
@@ -171,6 +171,7 @@ class Engine:
         self.participant_scraping_enabled = True            # user-facing perf toggle, see set_participant_scraping()
         self._page_locks: dict[str, asyncio.Lock] = {}       # url -> lock, see _page_lock_for()
         self.browser_ready = False
+        self.browser_provider = None   # async (revision) -> chrome.exe path; set by MainWindow
         self._playwright = None
         self._browser = None
         self._tasks: list[asyncio.Task] = []
@@ -196,49 +197,43 @@ class Engine:
         Log panel and the persistent file log."""
         try:
             resolved = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
-            note = resolved if resolved else "<unset — expected; Chromium is bundled, frozen-mode default applies>"
+            note = resolved if resolved else "<unset — expected; the app launches Chromium from its own fixed folder>"
             self.log(f"Starting browser engine — PLAYWRIGHT_BROWSERS_PATH = {note}", "info")
             self._playwright = await async_playwright().start()
             launch_args = ["--deny-permission-prompts", "--window-size=1200,800"]
 
-            # Frozen builds only: run Chromium from a fixed folder instead of
-            # the per-launch %TEMP%\_MEIxxxxxx one, so Windows Firewall sees
-            # the same program every time and asks at most once (see
-            # paths.stable_chromium_dir). Any failure falls back to the
-            # bundled copy — worse (the prompt returns), never fatal.
-            stable_exe = None
+            # Frozen builds only: Chromium is NOT inside the exe (it was 64% of every
+            # update download). It lives in a fixed folder — the installer puts it
+            # there, earlier app versions left a copy there, or it is downloaded
+            # once below — so Windows Firewall also sees the same program every
+            # time and asks at most once (see browser_setup.py).
+            browser_exe = None
             if getattr(sys, "frozen", False):
-                bundled = self._playwright.chromium.executable_path
-                if not os.path.isfile(stable_chromium_exe_for(bundled)):
-                    self.log("Preparing the browser (first launch after an install or "
-                             "update only — this takes a moment)...", "info")
-                stable_exe, why = await asyncio.to_thread(ensure_stable_chromium, bundled)
-                if stable_exe:
-                    self.log(f"Browser runs from a fixed location (Windows Firewall will "
-                             f"only ask once): {stable_exe}", "info")
-                else:
-                    self.log(f"Could not set up the fixed browser location ({why}) — using the "
-                             f"bundled browser (Windows may ask about the firewall again).", "warn")
+                rev = required_revision()
+                browser_exe = browser_exe_path(rev)
+                if not os.path.isfile(browser_exe):
+                    if self.browser_provider is None:
+                        raise RuntimeError("The browser isn't installed and there's no way to "
+                                           "download it. Reinstall using the latest installer.")
+                    self.log("The browser isn't on this computer yet — downloading it once "
+                             "(about 170 MB)...", "info")
+                    browser_exe = await self.browser_provider(rev)
+                await asyncio.to_thread(remove_other_revisions, rev)   # old revisions left by earlier versions
+                self.log(f"Browser runs from a fixed location (Windows Firewall will only "
+                         f"ask once): {browser_exe}", "info")
 
-            try:
-                if stable_exe:
-                    self._browser = await self._playwright.chromium.launch(
-                        headless=False, args=launch_args, executable_path=stable_exe)
-                else:
-                    self._browser = await self._playwright.chromium.launch(
-                        headless=False, args=launch_args)
-            except Exception as e:
-                if not stable_exe:
-                    raise
-                self.log(f"Fixed-location browser failed to start ({e}) — retrying with "
-                         f"the bundled browser.", "warn")
+            if browser_exe:
+                self._browser = await self._playwright.chromium.launch(
+                    headless=False, args=launch_args, executable_path=browser_exe)
+            else:
                 self._browser = await self._playwright.chromium.launch(
                     headless=False, args=launch_args)
         except Exception as e:
             self.log(
                 f"❌ Failed to start the browser engine: {e}. Sessions cannot "
-                f"launch until this is fixed — check that Chromium was "
-                f"installed correctly (see the app's install/setup docs).",
+                f"launch until this is fixed — check your internet connection and "
+                f"restart the app (it will offer to download the browser again), or "
+                f"reinstall using the latest installer.",
                 "err",
             )
             return

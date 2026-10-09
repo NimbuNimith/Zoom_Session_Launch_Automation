@@ -187,7 +187,8 @@ def _fmt_eta(seconds: float) -> str:
 
 
 class UpdateProgressDialog(QDialog):
-    """Shown while an app update downloads (see updater.py). Same look as
+    """Shown while an app update (updater.py) or the one-time browser
+    download (browser_ui.py) runs. Same look as
     _StyledDialog, but it has to stay alive and be updated while the
     download runs, which _StyledDialog's build-once layout can't do.
 
@@ -196,10 +197,11 @@ class UpdateProgressDialog(QDialog):
 
     cancel_requested = Signal()
 
-    def __init__(self, parent, new_version: str):
+    def __init__(self, parent, new_version: str = "", heading: str = None,
+                 message: str = None, window_title: str = "Downloading Update"):
         super().__init__(parent)
         self._finished = False
-        self.setWindowTitle("Downloading Update")
+        self.setWindowTitle(window_title)
         self.setWindowIcon(_app_icon())
         self.setMinimumWidth(420)
         self.setModal(True)
@@ -209,11 +211,11 @@ class UpdateProgressDialog(QDialog):
         v.setContentsMargins(20, 18, 20, 16)
         v.setSpacing(12)
 
-        title_lbl = QLabel(f"Downloading v{new_version}")
+        title_lbl = QLabel(heading or f"Downloading v{new_version}")
         title_lbl.setStyleSheet(f"font-size: 13px; font-weight: 700; color: {theme.INK};")
         v.addWidget(title_lbl)
 
-        msg_lbl = QLabel("The app will restart automatically when the download finishes.")
+        msg_lbl = QLabel(message or "The app will restart automatically when the download finishes.")
         msg_lbl.setWordWrap(True)
         msg_lbl.setStyleSheet(f"font-size: 11px; color: {theme.MUTED};")
         v.addWidget(msg_lbl)
@@ -254,6 +256,12 @@ class UpdateProgressDialog(QDialog):
             text = f"{_fmt_mb(done)} downloaded"
             if speed > 0:
                 text += f"  ·  {speed / (1024 * 1024):.1f} MB/s"
+        self.detail.setText(text)
+
+    @Slot(str)
+    def set_status(self, text: str):
+        """A step with no byte count (e.g. unpacking): indeterminate bar + text."""
+        self.bar.setRange(0, 0)
         self.detail.setText(text)
 
     def finish(self):
@@ -735,6 +743,10 @@ class MainWindow(QMainWindow):
 
         self.table_model = SessionTableModel()
         self.engine = Engine(self.table_model, self.log_event)
+        # Only used when the browser isn't already on disk (the installer normally
+        # puts it there) — see browser_setup.py / browser_ui.py.
+        from browser_ui import provide_browser
+        self.engine.browser_provider = lambda rev: provide_browser(self, rev)
         self.auto_pilot_running = False
         self._auto_pilot_timer = QTimer(self)
         self._auto_pilot_timer.setInterval(10_000)

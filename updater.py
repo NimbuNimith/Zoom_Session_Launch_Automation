@@ -26,35 +26,17 @@ version.txt on main LAST, so nobody is prompted before the file exists.
 
 import os
 import sys
-import shutil
 import threading
-import time
-from collections import deque
 
 import requests
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
+from downloader import download_file, friendly_error, DownloadCancelled
 from update_swap import write_swap_script, launch_swap_script
 
-CURRENT_VERSION = "2.4.2"
+CURRENT_VERSION = "2.5.0"
 VERSION_URL  = "https://raw.githubusercontent.com/NimbuNimith/Zoom_Session_Launch_Automation/main/version.txt"
 DOWNLOAD_URL = "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/latest/download/Zoom_Ai_latest.exe"
-
-_CHUNK_SIZE = 256 * 1024          # 8 KB chunks mean ~55,000 loop turns for this file
-_CONNECT_TIMEOUT = 15             # seconds
-_READ_TIMEOUT = 30                # a stalled connection fails after this long, not never
-_PROGRESS_INTERVAL = 0.1          # emit at most ~10 progress updates a second
-_SPEED_WINDOW = 3.0               # seconds of history the speed/ETA is averaged over
-_SPACE_MARGIN = 1.1               # need this much free disk space relative to the download
-
-
-class _Cancelled(Exception):
-    pass
-
-
-def _mb(n: float) -> str:
-    return f"{n / (1024 * 1024):.0f} MB"
-
 
 class _DownloadSignals(QObject):
     """Lives on the UI thread; the worker thread only ever .emit()s on it, which
@@ -68,68 +50,13 @@ class _DownloadSignals(QObject):
 def _download_worker(url: str, part_path: str, final_path: str,
                      cancel: threading.Event, sig: _DownloadSignals):
     """Runs on a background thread. Never touches Qt widgets — it only emits."""
-    def cleanup():
-        try:
-            os.remove(part_path)
-        except OSError:
-            pass
-
     try:
-        with requests.get(url, stream=True, timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT)) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("Content-Length") or 0)
-
-            if total:
-                free = shutil.disk_usage(os.path.dirname(final_path) or ".").free
-                if free < total * _SPACE_MARGIN:
-                    raise IOError(
-                        f"Not enough free disk space. The update needs about "
-                        f"{_mb(total * _SPACE_MARGIN)} and only {_mb(free)} is free.")
-
-            received = 0
-            samples = deque([(time.monotonic(), 0)])
-            last_emit = 0.0
-            speed = 0.0
-            # Written to .part and only renamed to .new once complete, so a
-            # dropped connection can never leave something that looks like a
-            # finished download.
-            with open(part_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=_CHUNK_SIZE):
-                    if cancel.is_set():
-                        raise _Cancelled()
-                    f.write(chunk)
-                    received += len(chunk)
-                    now = time.monotonic()
-                    samples.append((now, received))
-                    while len(samples) > 2 and now - samples[0][0] > _SPEED_WINDOW:
-                        samples.popleft()
-                    if now - last_emit >= _PROGRESS_INTERVAL:
-                        last_emit = now
-                        span = now - samples[0][0]
-                        speed = (received - samples[0][1]) / span if span > 0 else 0.0
-                        sig.progress.emit(received, total, speed)
-
-        if cancel.is_set():
-            raise _Cancelled()
-        if total and received != total:
-            raise IOError(f"The download was incomplete ({_mb(received)} of {_mb(total)}). "
-                          f"Check your connection and try again.")
-        with open(part_path, "rb") as f:
-            if f.read(2) != b"MZ":
-                raise IOError("The downloaded file is not a Windows program.")
-        sig.progress.emit(received, total, speed)
-        os.replace(part_path, final_path)
-    except _Cancelled:
-        cleanup()
+        download_file(url, part_path, final_path, cancel, sig.progress.emit, magic=b"MZ",
+                      magic_error="The downloaded file is not a Windows program.")
+    except DownloadCancelled:
         sig.cancelled.emit()
-    except requests.exceptions.RequestException as e:
-        cleanup()
-        sig.failed.emit("The connection was interrupted or the download isn't available. "
-                        "Check your internet connection and try again.\n"
-                        f"({type(e).__name__})")
     except Exception as e:
-        cleanup()
-        sig.failed.emit(str(e))
+        sig.failed.emit(friendly_error(e))
     else:
         sig.finished.emit()
 

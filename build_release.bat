@@ -1,15 +1,12 @@
 @echo off
 REM build_release.bat
 REM -------------------
-REM Three steps now, not two. Run from the project folder.
+REM Four steps. Run from the project folder.
 REM
-REM Chromium is bundled INTO the exe now (see Zoom_Ai_latest.spec's
-REM docstring for why the earlier "install it externally via the
-REM installer" approach was reverted). That means THIS build machine's
-REM own Playwright installation needs Chromium present, in hermetic
-REM mode, before PyInstaller runs — Step 1 below does that every time;
-REM it's fast and a no-op if already installed, so it's safe to leave in
-REM permanently rather than remembering to run it manually once.
+REM Chromium is NOT bundled into the exe any more (that was 64% of every
+REM auto-update download). It travels in the INSTALLER instead, and the app
+REM downloads it once from a GitHub Release asset if it's ever missing. See
+REM Zoom_Ai_latest.spec and installer.iss for the full story.
 REM
 REM Prerequisites (one-time, per build machine):
 REM   pip install -r requirements.txt pyinstaller
@@ -18,16 +15,25 @@ REM   (installs ISCC.exe — add its folder to PATH, or edit ISCC_PATH below)
 
 set ISCC_PATH="C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 
-echo === Step 1: Ensure Chromium is installed hermetically for bundling ===
+echo === Step 1: Make sure Playwright's Chromium is installed on this machine ===
+echo     (the installer copies it from here; it is no longer bundled into the exe)
 set PLAYWRIGHT_BROWSERS_PATH=0
 playwright install chromium
 if errorlevel 1 (
-    echo playwright install chromium failed — stopping before the PyInstaller step.
+    echo playwright install chromium failed — stopping.
     exit /b 1
 )
 
 echo.
-echo === Step 2: PyInstaller ===
+echo === Step 2: Browser assets (installer include + fallback download zip) ===
+python tools\prepare_release_assets.py
+if errorlevel 1 (
+    echo prepare_release_assets failed — stopping.
+    exit /b 1
+)
+
+echo.
+echo === Step 3: PyInstaller ===
 pyinstaller Zoom_Ai_latest.spec --noconfirm --clean
 if errorlevel 1 (
     echo PyInstaller build failed — stopping before the installer step.
@@ -35,7 +41,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo === Step 3: Inno Setup ===
+echo === Step 4: Inno Setup ===
 %ISCC_PATH% installer.iss
 if errorlevel 1 (
     echo Inno Setup compile failed.
@@ -44,10 +50,11 @@ if errorlevel 1 (
 
 echo.
 echo Done. Installer is in the Output\ folder.
-echo dist\Zoom_Ai_latest.exe should now be ~250-300MB larger than before
-echo (Chromium is bundled in) — if it isn't, Step 1 likely didn't find/
-echo install Chromium and the .spec's build-time guard should have
-echo caught that already, but double check the output above.
-echo Next: upload BOTH dist\Zoom_Ai_latest.exe (for auto-update)
-echo AND the installer .exe (for new installs) to the GitHub Release, and
-echo update version.txt to match updater.py's CURRENT_VERSION.
+echo dist\Zoom_Ai_latest.exe should be ~150-160 MB (no browser inside).
+echo.
+echo Release checklist:
+echo   1. If Step 2 printed a "gh release create chromium-..." command for a NEW
+echo      Chromium revision, run it once (skip if that release already exists).
+echo   2. Upload dist\Zoom_Ai_latest.exe to the GitHub Release (for auto-update).
+echo   3. Share the installer from Output\ with learners (it includes the browser).
+echo   4. Set version.txt to match updater.py's CURRENT_VERSION — LAST.
