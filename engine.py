@@ -52,6 +52,15 @@ RECAPTCHA_PERSIST_SECONDS = 8            # error must stay on screen this long b
 class _RecaptchaUnavailable(Exception):
     pass
 
+
+class PollNotAvailable(RuntimeError):
+    """The meeting simply doesn't have this Poll (missing, or only a Quiz). A retry
+    would only open and read the same panel again, so none is made. `short` is
+    what the row's Poll column shows."""
+    def __init__(self, message: str, short: str):
+        super().__init__(message)
+        self.short = short
+
 DEFAULT_POLL_NAME = "End Session Poll"   # fallback / default poll to pre-select
 POLL_LAUNCH_MAX_ATTEMPTS = 2             # 1 initial try + 1 retry
 AUTO_POLL_END_MINUTES = 15               # auto-launch poll(s) N minutes before End Time
@@ -1111,16 +1120,27 @@ class Engine:
             except Exception as e:
                 last_err = e
                 self.log(f"{prefix}[POLL] attempt {attempt} failed for '{m.session_name}': {e}", "warn")
+                if isinstance(e, PollNotAvailable):
+                    break             # the meeting doesn't have it; trying again can't change that
                 if attempt < POLL_LAUNCH_MAX_ATTEMPTS:
                     await asyncio.sleep(2)
 
         m.poll_launching = False
-        self.model.set_fields(url, poll_status=f"{prefix}Failed", poll_action="Launch Poll")
+        short = getattr(last_err, "short", "Failed")
+        self.model.set_fields(url, poll_status=f"{prefix}{short}", poll_action="Launch Poll")
         detail = f"{prefix}Poll launch failed for '{m.session_name}': {last_err}"
         shot = await _save_failure_screenshot(m.page, "poll_failures", m.session_name)
         if shot:
             detail += f" | screenshot: {shot}"
         self.log(detail, "err")
+        # Don't leave the Polls window sitting open over the meeting after a failure
+        # (it looked like the session was "stuck" on the poll list).
+        try:
+            if m.page and not m.page.is_closed():
+                async with self._page_lock_for(url):
+                    await _close_polls_panel(m.page)
+        except Exception:
+            pass
         return False
 
     async def launch_poll_for_many(self, urls: list):
@@ -2070,12 +2090,13 @@ async def _do_launch_poll_once(page, poll_name: str, is_prism: bool = False):
         if poll_name.casefold() in {q.casefold() for q in quizzes}:
             # Seen 2026-10-12: 'End Session Poll' was a Quiz in a real meeting, and
             # "was not found in the list" sent people looking for a missing poll.
-            raise RuntimeError(
+            raise PollNotAvailable(
                 f"'{poll_name}' exists in this meeting only as a Quiz, and Command Center "
                 f"launches Polls only. {listing}. Pick one of the Polls in this row's "
-                f"Poll Select dropdown, or recreate '{poll_name}' as a Poll.")
-        raise RuntimeError(f"There is no Poll named '{poll_name}' in this meeting. {listing}. "
-                           f"Pick one of those in this row's Poll Select dropdown if one fits.")
+                f"Poll Select dropdown, or recreate '{poll_name}' as a Poll.", "Failed: is a quiz")
+        raise PollNotAvailable(
+            f"There is no Poll named '{poll_name}' in this meeting. {listing}. "
+            f"Pick one of those in this row's Poll Select dropdown if one fits.", "Failed: not found")
 
     await _click_launch_on_row(page, row)  # raises on failure/ambiguity
 

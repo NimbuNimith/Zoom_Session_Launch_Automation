@@ -945,7 +945,7 @@ class MainWindow(QMainWindow):
                             ("cohosts", 180), ("participant_count", 100),
                             ("launched_at", 100), ("status", 190),
                             ("action", 130), ("retry", 90),
-                            ("poll_status", 110), ("poll_select", 190), ("poll_action", 130),
+                            ("poll_status", 140), ("poll_select", 190), ("poll_action", 130),
                             ("prism_type", 150), ("prism_sync", 160),
                             ("session_id", 160), ("meeting_code", 110)]:
             self.table.setColumnWidth(COL_INDEX[key], width)
