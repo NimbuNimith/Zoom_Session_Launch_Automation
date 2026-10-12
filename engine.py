@@ -38,6 +38,20 @@ from prism_status_push import push_prism_live_status_async
 
 MAX_SESSIONS_PER_ACCOUNT = 2
 
+# Zoom's sign-in page sometimes can't reach reCAPTCHA ("Could not connect to the
+# reCAPTCHA service") and the Sign In button then spins forever. Seen on
+# 2026-10-12 with 4 and 2 Zoom sessions launching together: the whole 100 s wait
+# was spent on it, 5 of 6 logins failed. So: only a couple of sign-ins at a time,
+# and when the error persists, reload the sign-in page and try again.
+MAX_CONCURRENT_SIGNINS = 2
+SIGNIN_ATTEMPTS = 3
+RECAPTCHA_ERROR_TEXT = "could not connect to the recaptcha service"
+RECAPTCHA_PERSIST_SECONDS = 8            # error must stay on screen this long before it counts
+
+
+class _RecaptchaUnavailable(Exception):
+    pass
+
 DEFAULT_POLL_NAME = "End Session Poll"   # fallback / default poll to pre-select
 POLL_LAUNCH_MAX_ATTEMPTS = 2             # 1 initial try + 1 retry
 AUTO_POLL_END_MINUTES = 15               # auto-launch poll(s) N minutes before End Time
@@ -196,6 +210,13 @@ async def _save_failure_screenshot(page, folder: str, label: str) -> str:
         return ""
 
 
+async def _recaptcha_unavailable(page) -> bool:
+    try:
+        return RECAPTCHA_ERROR_TEXT in (await page.inner_text("body", timeout=3000)).lower()
+    except Exception:
+        return False
+
+
 async def _block_zoom_protocol(route):
     # Registered with the route pattern "zoommtg://**" (see call sites),
     # so this only ever fires for that one protocol — every normal
@@ -232,6 +253,7 @@ class Engine:
         self._tasks: list[asyncio.Task] = []
         self._browser_not_ready_warned = False
         self._shutting_down = False
+        self._signin_gate = asyncio.Semaphore(MAX_CONCURRENT_SIGNINS)
 
     # ── Startup ──────────────────────────────────────────────────────
     async def start(self):
@@ -452,6 +474,18 @@ class Engine:
             "⚠️ Launch requested but the browser engine isn't ready yet — "
             "check the Event Log above for a startup error.", "warn")
 
+    async def _goto_with_retry(self, page, url: str, label: str):
+        """The meeting page sometimes takes longer than 90 s to load when many
+        sessions open at once (a Prism launch failed on exactly that). One
+        more try costs nothing when it works and saves a manual Retry."""
+        try:
+            await page.goto(url, timeout=90000, wait_until="domcontentloaded")
+        except Exception as e:
+            if "Timeout" not in str(e):
+                raise
+            self.log(f"{label}: the meeting page took over 90 s to load — trying once more.", "warn")
+            await page.goto(url, timeout=90000, wait_until="domcontentloaded")
+
     # ── Launch: Zoom ─────────────────────────────────────────────────
     def launch_zoom(self, url: str):
         if not self.browser_ready:
@@ -531,143 +565,169 @@ class Engine:
                 SIGNIN_FORM_SEL = "input[name='email'], #email"
                 PASSWORD_FIELD_SEL = "input[name='password'], #password"
                 login_ok = True
-                try:
-                    await page.goto("https://zoom.us/signin", timeout=100000, wait_until="domcontentloaded")
-                    # Zoom's sign-in form is rendered by client-side JS
-                    # AFTER domcontentloaded fires — checking .count()
-                    # instantly can find zero email inputs simply
-                    # because the form hasn't mounted yet, not because
-                    # we're actually logged in. Confirmed live TWICE now:
-                    # first with a zero-wait check, then again with only
-                    # a 5s allowance — under the load conditions seen
-                    # today, page loads have taken 90-100+ seconds (see
-                    # the white-screen timeouts logged earlier), so 5s
-                    # was nowhere near enough margin. Matching the same
-                    # 100s timeout used everywhere else in this function
-                    # costs nothing in the normal case — a genuine
-                    # already-logged-in redirect resolves almost
-                    # instantly — and only matters for the slow case,
-                    # which is exactly the one that was failing.
-                    try:
-                        await page.wait_for_selector(SIGNIN_FORM_SEL, state="attached", timeout=100000)
-                        email_form_present = True
-                    except Exception:
-                        email_form_present = await page.locator(SIGNIN_FORM_SEL).count() > 0
-
-                    if email_form_present:
-                        already_logged_in = False
-                    elif "/signin" not in page.url.lower():
-                        already_logged_in = True
-                    else:
-                        # Email form is gone, but we're still somewhere
-                        # under zoom.us/signin — confirmed live: Zoom can
-                        # redirect through OTHER sign-in sub-steps
-                        # (.../signin#/login/bind-passkey — a passkey
-                        # enrollment prompt) that don't show the email
-                        # field at all. That's not "logged in", and it's
-                        # not the plain email form either — the
-                        # automation has no logic for it, so surface it
-                        # explicitly rather than misreading it as either.
-                        if await _wait_until_signed_in(page, self.log, timeout=30.0):
-                            already_logged_in = True
-                        else:
-                            raise RuntimeError(f"stuck on an unhandled sign-in step at {page.url}")
-
-                    if already_logged_in:
-                        self.log(f"Already logged in: {email} (at {page.url})", "ok")
-                    else:
-                        await page.click(SIGNIN_FORM_SEL, timeout=100000)
-                        await asyncio.sleep(0.5)
-                        await page.fill(SIGNIN_FORM_SEL, email)
-                        for _ in range(3):
-                            try:    await page.click("button:has-text('Next')", timeout=100000)
-                            except Exception: pass
+                async with self._signin_gate:
+                    for _signin_attempt in range(1, SIGNIN_ATTEMPTS + 1):
+                        try:
+                            await page.goto("https://zoom.us/signin", timeout=100000, wait_until="domcontentloaded")
+                            # Zoom's sign-in form is rendered by client-side JS
+                            # AFTER domcontentloaded fires — checking .count()
+                            # instantly can find zero email inputs simply
+                            # because the form hasn't mounted yet, not because
+                            # we're actually logged in. Confirmed live TWICE now:
+                            # first with a zero-wait check, then again with only
+                            # a 5s allowance — under the load conditions seen
+                            # today, page loads have taken 90-100+ seconds (see
+                            # the white-screen timeouts logged earlier), so 5s
+                            # was nowhere near enough margin. Matching the same
+                            # 100s timeout used everywhere else in this function
+                            # costs nothing in the normal case — a genuine
+                            # already-logged-in redirect resolves almost
+                            # instantly — and only matters for the slow case,
+                            # which is exactly the one that was failing.
                             try:
+                                await page.wait_for_selector(SIGNIN_FORM_SEL, state="attached", timeout=100000)
+                                email_form_present = True
+                            except Exception:
+                                email_form_present = await page.locator(SIGNIN_FORM_SEL).count() > 0
+
+                            if email_form_present:
+                                already_logged_in = False
+                            elif "/signin" not in page.url.lower():
+                                already_logged_in = True
+                            else:
+                                # Email form is gone, but we're still somewhere
+                                # under zoom.us/signin — confirmed live: Zoom can
+                                # redirect through OTHER sign-in sub-steps
+                                # (.../signin#/login/bind-passkey — a passkey
+                                # enrollment prompt) that don't show the email
+                                # field at all. That's not "logged in", and it's
+                                # not the plain email form either — the
+                                # automation has no logic for it, so surface it
+                                # explicitly rather than misreading it as either.
+                                if await _wait_until_signed_in(page, self.log, timeout=30.0):
+                                    already_logged_in = True
+                                else:
+                                    raise RuntimeError(f"stuck on an unhandled sign-in step at {page.url}")
+
+                            if already_logged_in:
+                                self.log(f"Already logged in: {email} (at {page.url})", "ok")
+                                break
+                            else:
+                                await page.click(SIGNIN_FORM_SEL, timeout=100000)
+                                await asyncio.sleep(0.5)
+                                await page.fill(SIGNIN_FORM_SEL, email)
+                                for _ in range(3):
+                                    try:    await page.click("button:has-text('Next')", timeout=100000)
+                                    except Exception: pass
+                                    try:
+                                        await page.wait_for_selector(
+                                            PASSWORD_FIELD_SEL, state="visible", timeout=100000)
+                                        break
+                                    except Exception:
+                                        await asyncio.sleep(2)
                                 await page.wait_for_selector(
                                     PASSWORD_FIELD_SEL, state="visible", timeout=100000)
-                                break
-                            except Exception:
-                                await asyncio.sleep(2)
-                        await page.wait_for_selector(
-                            PASSWORD_FIELD_SEL, state="visible", timeout=100000)
-                        await page.fill(PASSWORD_FIELD_SEL, password)
-                        await page.click("button:has-text('Sign In'), button:has-text('Sign in')", timeout=100000)
+                                await page.fill(PASSWORD_FIELD_SEL, password)
+                                await page.click("button:has-text('Sign In'), button:has-text('Sign in')", timeout=100000)
 
-                        # Success = the PASSWORD form is GONE *and* we've
-                        # actually left the /signin URL space. Waiting on
-                        # the email selector here (SIGNIN_FORM_SEL) was a
-                        # real bug: the email step is a page ago by this
-                        # point — Zoom's flow is email page -> password
-                        # page, and the email input is already absent the
-                        # moment the password page appears, well before
-                        # Sign In is even clicked. That made the wait
-                        # resolve instantly, so this check was firing
-                        # while Zoom's own Sign In button was still mid-
-                        # submission (its loading spinner visibly still
-                        # spinning in the captured screenshot), reporting
-                        # a false failure on a login that just hadn't
-                        # finished processing yet. Waiting on the
-                        # password field — what's actually still on
-                        # screen right after clicking Sign In — is the
-                        # correct signal for "this specific submission is
-                        # done," whether that ends in success or a real
-                        # failure/passkey step.
-                        try:
-                            await page.wait_for_selector(PASSWORD_FIELD_SEL, state="detached", timeout=100000)
-                            form_gone = True
-                        except Exception:
-                            # A detached-wait can itself time out if Zoom
-                            # merely hides the form instead of removing
-                            # it from the DOM — fall back to a direct
-                            # presence check before concluding failure.
-                            form_gone = await page.locator(PASSWORD_FIELD_SEL).count() == 0
-                        if not form_gone:
-                            raise RuntimeError(
-                                f"still on the password entry page after submitting — stuck at {page.url}")
-                        if "/signin" in page.url.lower():
-                            # The passkey offer is skipped here; anything else
-                            # still counts as stuck once the wait runs out.
-                            if not await _wait_until_signed_in(page, self.log, timeout=60.0):
-                                raise RuntimeError(
-                                    f"password form is gone but still stuck somewhere in Zoom's "
-                                    f"sign-in flow (e.g. a verification step) at {page.url}")
-                        self.log(f"Login success: {email} (landed at {page.url})", "ok")
-                except Exception as e:
-                    # Diagnostic capture — a generic "Login failed" line
-                    # alone doesn't say WHERE it got stuck (still on
-                    # sign-in? bounced back after password? a CAPTCHA/
-                    # verification step the selectors don't know about?).
-                    # Grab the current URL, a screenshot, and any visible
-                    # page text so a failure can be diagnosed from the
-                    # log folder without anyone having to be watching
-                    # live when it happens.
-                    current_url = "<unknown>"
-                    try:
-                        current_url = page.url
-                    except Exception:
-                        pass
-                    snippet = ""
-                    try:
-                        body_text = await page.inner_text("body")
-                        snippet = " ".join(body_text.split())[:300]
-                    except Exception:
-                        pass
-                    shot_path = ""
-                    try:
-                        from applog import LOG_DIR
-                        shot_dir = os.path.join(os.path.dirname(LOG_DIR), "login_failures")
-                        os.makedirs(shot_dir, exist_ok=True)
-                        ts = _now_hhmmss().replace(":", "-")
-                        safe_email = email.replace("@", "_at_").replace(".", "_")
-                        shot_path = os.path.join(shot_dir, f"{safe_email}_{ts}.png")
-                        await page.screenshot(path=shot_path, full_page=True)
-                    except Exception:
-                        pass
-                    detail = f"Login failed for {email}: {e} | stuck at: {current_url}"
-                    if shot_path: detail += f" | screenshot: {shot_path}"
-                    if snippet: detail += f" | page text: {snippet}"
-                    self.log(detail, "warn")
-                    login_ok = False
+                                # Success = the PASSWORD form is GONE *and* we've
+                                # actually left the /signin URL space. Waiting on
+                                # the email selector here (SIGNIN_FORM_SEL) was a
+                                # real bug: the email step is a page ago by this
+                                # point — Zoom's flow is email page -> password
+                                # page, and the email input is already absent the
+                                # moment the password page appears, well before
+                                # Sign In is even clicked. That made the wait
+                                # resolve instantly, so this check was firing
+                                # while Zoom's own Sign In button was still mid-
+                                # submission (its loading spinner visibly still
+                                # spinning in the captured screenshot), reporting
+                                # a false failure on a login that just hadn't
+                                # finished processing yet. Waiting on the
+                                # password field — what's actually still on
+                                # screen right after clicking Sign In — is the
+                                # correct signal for "this specific submission is
+                                # done," whether that ends in success or a real
+                                # failure/passkey step.
+                                # Poll instead of one long wait, so Zoom's "Could not
+                                # connect to the reCAPTCHA service" can be told apart
+                                # from a merely slow sign-in and retried early. (A
+                                # detached-wait can also time out if Zoom merely hides
+                                # the form instead of removing it — the presence check
+                                # covers that too.)
+                                loop_clock = asyncio.get_running_loop()
+                                wait_deadline = loop_clock.time() + 100
+                                recaptcha_since = None
+                                form_gone = False
+                                while loop_clock.time() < wait_deadline:
+                                    if await page.locator(PASSWORD_FIELD_SEL).count() == 0:
+                                        form_gone = True
+                                        break
+                                    if await _recaptcha_unavailable(page):
+                                        recaptcha_since = recaptcha_since or loop_clock.time()
+                                        if loop_clock.time() - recaptcha_since >= RECAPTCHA_PERSIST_SECONDS:
+                                            raise _RecaptchaUnavailable()
+                                    else:
+                                        recaptcha_since = None
+                                    await asyncio.sleep(1.0)
+                                if not form_gone:
+                                    raise RuntimeError(
+                                        f"still on the password entry page after submitting — stuck at {page.url}")
+                                if "/signin" in page.url.lower():
+                                    # The passkey offer is skipped here; anything else
+                                    # still counts as stuck once the wait runs out.
+                                    if not await _wait_until_signed_in(page, self.log, timeout=60.0):
+                                        raise RuntimeError(
+                                            f"password form is gone but still stuck somewhere in Zoom's "
+                                            f"sign-in flow (e.g. a verification step) at {page.url}")
+                                self.log(f"Login success: {email} (landed at {page.url})", "ok")
+                                break
+                        except Exception as e:
+                            if isinstance(e, _RecaptchaUnavailable) and _signin_attempt < SIGNIN_ATTEMPTS:
+                                self.log(f"Zoom's reCAPTCHA couldn't connect for {email} — reloading the "
+                                         f"sign-in page (attempt {_signin_attempt + 1} of {SIGNIN_ATTEMPTS}).", "warn")
+                                await asyncio.sleep(random.uniform(2, 5))
+                                continue
+                            if isinstance(e, _RecaptchaUnavailable):
+                                e = RuntimeError("Zoom's reCAPTCHA couldn't be reached on any of "
+                                                 f"{SIGNIN_ATTEMPTS} attempts (page shows 'Could not connect to the "
+                                                 f"reCAPTCHA service')")
+                            # Diagnostic capture — a generic "Login failed" line
+                            # alone doesn't say WHERE it got stuck (still on
+                            # sign-in? bounced back after password? a CAPTCHA/
+                            # verification step the selectors don't know about?).
+                            # Grab the current URL, a screenshot, and any visible
+                            # page text so a failure can be diagnosed from the
+                            # log folder without anyone having to be watching
+                            # live when it happens.
+                            current_url = "<unknown>"
+                            try:
+                                current_url = page.url
+                            except Exception:
+                                pass
+                            snippet = ""
+                            try:
+                                body_text = await page.inner_text("body")
+                                snippet = " ".join(body_text.split())[:300]
+                            except Exception:
+                                pass
+                            shot_path = ""
+                            try:
+                                from applog import LOG_DIR
+                                shot_dir = os.path.join(os.path.dirname(LOG_DIR), "login_failures")
+                                os.makedirs(shot_dir, exist_ok=True)
+                                ts = _now_hhmmss().replace(":", "-")
+                                safe_email = email.replace("@", "_at_").replace(".", "_")
+                                shot_path = os.path.join(shot_dir, f"{safe_email}_{ts}.png")
+                                await page.screenshot(path=shot_path, full_page=True)
+                            except Exception:
+                                pass
+                            detail = f"Login failed for {email}: {e} | stuck at: {current_url}"
+                            if shot_path: detail += f" | screenshot: {shot_path}"
+                            if snippet: detail += f" | page text: {snippet}"
+                            self.log(detail, "warn")
+                            login_ok = False
+                            break
 
                 if not login_ok:
                     # Previously this fell through to page.goto(target)
@@ -692,7 +752,7 @@ class Engine:
             mid = m.zoom_meeting_id() or ""
             target = (f"https://upgrad.zoom.us/wc/{mid}/start"
                       if (mode == "HOST" and email) else f"https://upgrad.zoom.us/wc/{mid}/join")
-            await page.goto(target, timeout=90000, wait_until="domcontentloaded")
+            await self._goto_with_retry(page, target, m.session_name)
 
             try:
                 rescue = page.locator("text=Join from your browser")
@@ -771,7 +831,7 @@ class Engine:
             launch_url = build_launch_url(mid, cleaned_url, mode="start")
 
             self.model.set_fields(url, status="🟣 Opening Prism...", action="...")
-            await page.goto(launch_url, timeout=90000, wait_until="domcontentloaded")
+            await self._goto_with_retry(page, launch_url, m.session_name)
 
             try: await page.keyboard.press("Escape")
             except Exception: pass
@@ -1646,7 +1706,16 @@ async def _hover_click(page, locator, settle: float = 0.45):
     except Exception:
         pass
     await asyncio.sleep(settle)
-    await locator.click(force=True, timeout=5000)
+    try:
+        await locator.click(force=True, timeout=5000)
+    except Exception as e:
+        # Playwright reports a click as failed when the page is still "waiting for
+        # scheduled navigations to finish" afterwards — on a busy page that wait
+        # overran 5 s and failed poll launches whose click had in fact gone through
+        # ("click action done" is in the error). The result is checked by the callers.
+        if "click action done" in str(e):
+            return
+        raise
 
 
 async def _bbox_settled(locator, tries: int = 8) -> bool:
@@ -1995,14 +2064,18 @@ async def _do_launch_poll_once(page, poll_name: str, is_prism: bool = False):
 
     row = await _find_poll_row(page, poll_name, is_prism=is_prism)
     if row is None:
-        # Say what the panel actually showed, so a failure explains itself.
-        try:
-            present = [t.strip() for t in await page.locator(".poll-list-item__topic-name").all_inner_texts()]
-        except Exception:
-            present = []
-        raise RuntimeError(
-            f"Poll '{poll_name}' was not found in the list "
-            f"(entries in the panel: {present if present else 'none'})")
+        polls, quizzes = await _poll_and_quiz_titles(page)
+        listing = (f"Polls in this meeting: {polls if polls else 'none'}"
+                   + (f"; Quizzes: {quizzes}" if quizzes else ""))
+        if poll_name.casefold() in {q.casefold() for q in quizzes}:
+            # Seen 2026-10-12: 'End Session Poll' was a Quiz in a real meeting, and
+            # "was not found in the list" sent people looking for a missing poll.
+            raise RuntimeError(
+                f"'{poll_name}' exists in this meeting only as a Quiz, and Command Center "
+                f"launches Polls only. {listing}. Pick one of the Polls in this row's "
+                f"Poll Select dropdown, or recreate '{poll_name}' as a Poll.")
+        raise RuntimeError(f"There is no Poll named '{poll_name}' in this meeting. {listing}. "
+                           f"Pick one of those in this row's Poll Select dropdown if one fits.")
 
     await _click_launch_on_row(page, row)  # raises on failure/ambiguity
 
@@ -2022,6 +2095,19 @@ async def _do_launch_poll_once(page, poll_name: str, is_prism: bool = False):
             return
     raise RuntimeError(f"Clicked Launch for '{poll_name}' but the poll never started "
                        f"(no 'Polling in progress' / 'End Poll' appeared) — " + await _polls_debug(page))
+
+
+async def _poll_and_quiz_titles(page):
+    """(poll titles, quiz titles) currently listed in the open Polls/Quizzes panel."""
+    try:
+        rows = await page.evaluate("""() => Array.from(document.querySelectorAll('.poll-list-item')).map(r => ({
+            n: ((r.querySelector('.poll-list-item__topic-name') || {}).innerText || '').trim(),
+            d: ((r.querySelector('.poll-list-item__detail') || {}).innerText || '').trim()}))""")
+    except Exception:
+        return [], []
+    polls = [r["n"] for r in rows if r["n"] and re.match(r"^\s*Poll\b", r["d"], re.IGNORECASE)]
+    quizzes = [r["n"] for r in rows if r["n"] and re.match(r"^\s*Quiz\b", r["d"], re.IGNORECASE)]
+    return polls, quizzes
 
 
 async def _poll_started(page) -> bool:
