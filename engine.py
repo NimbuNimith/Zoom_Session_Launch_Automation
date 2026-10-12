@@ -921,10 +921,9 @@ class Engine:
         if not m or not m.page: return
         try:
             page = m.page
-            try:    await page.click("button:has-text('End')", timeout=5000)
-            except Exception: pass
-            await asyncio.sleep(0.5)
-            await page.click("button:has-text('End Meeting for All')", timeout=5000)
+            if not await _click_end_meeting_for_all(page):
+                raise RuntimeError("'End Meeting for All' never appeared")
+            await asyncio.sleep(1.0)
             await page.close()
             await self.cleanup_session(url)
             self.model.set_fields(url, status="⚫ Ended", action="Closed")
@@ -1358,16 +1357,28 @@ async def _find_meeting_context(page):
 
 
 async def _ensure_participants_panel_open(ctx) -> bool:
+    panel_sel = "text=/Participants\\s*\\(\\d+\\)/"
+
+    async def panel_open() -> bool:
+        try:
+            return (await ctx.locator(panel_sel).count() > 0
+                    and await ctx.locator(panel_sel).first.is_visible(timeout=1500))
+        except Exception:
+            return False
+
     try:
-        panel_sel = "text=/Participants\\s*\\(\\d+\\)/"
-        if await ctx.locator(panel_sel).count() > 0:
-            if await ctx.locator(panel_sel).first.is_visible(timeout=1500):
-                return True
+        if await panel_open():
+            return True
         btn = ctx.locator(_PARTICIPANTS_BTN_SEL)
         if await btn.count() > 0 and await btn.first.is_visible(timeout=2000):
-            await btn.first.click(force=True)
-            await asyncio.sleep(1)
-            return True
+            # Verified, not assumed: a lost first click (see _hover_click) used to
+            # leave the panel closed while this reported success.
+            for _attempt in range(2):
+                await _hover_click(ctx, btn.first)
+                for _ in range(6):
+                    await asyncio.sleep(0.25)
+                    if await panel_open():
+                        return True
     except Exception:
         pass
     return False
@@ -1508,69 +1519,157 @@ async def _polls_debug(page) -> str:
         return f"(could not inspect the page: {type(ex).__name__})"
 
 
+async def _click_end_meeting_for_all(page) -> bool:
+    """End → End Meeting for All. The first click on End is lost like any other
+    first toolbar click (see _hover_click) and used to be skipped with `except:
+    pass`, after which the missing 'End Meeting for All' button made the whole
+    thing fall through to 'Force Closed' with the meeting still running.
+    Returns True once 'End Meeting for All' has been clicked.
+
+    The floating Polls/Quizzes window (open right after Auto-Pilot launches a
+    poll) sits over the toolbar, and with it open clicking End opened nothing
+    at all (verified live 2026-10-12, three tries) — so it is closed first."""
+    if await _polls_panel_visible(page):
+        await _close_polls_panel(page)
+        await asyncio.sleep(0.6)
+    for _attempt in range(3):
+        # The toolbar's End button is aria-label="End". Matching on text alone
+        # also catches "End Poll" (visible whenever a poll is running or its
+        # panel is open) and, being earlier in the page, got clicked instead.
+        end = page.locator("button[aria-label='End']").filter(visible=True)
+        if await end.count() == 0:
+            end = page.get_by_role("button", name=re.compile(r"^\s*End\s*$")).filter(visible=True)
+        if await end.count() == 0:
+            end = page.locator("button:has-text('End')").filter(visible=True).filter(has_not_text="Poll")
+        if await end.count() == 0:
+            return False
+        await _hover_click(page, end.first)
+        target = page.get_by_text("End Meeting for All", exact=False).filter(visible=True)
+        for _ in range(8):
+            await asyncio.sleep(0.25)
+            if await target.count() > 0:
+                await _hover_click(page, target.first, settle=0.3)
+                return True
+    return False
+
+
+async def _hover_click(page, locator, settle: float = 0.45):
+    """Click a control in Zoom's meeting toolbar the way a person does: put the
+    pointer on it, give the toolbar a moment to react, then click.
+
+    Zoom's footer buttons (More, End, Participants...) ignore a click that
+    arrives together with the pointer's first move onto them — the hover
+    re-renders the button, the press and release land on different nodes, and
+    no click fires. Playwright's click (forced or not) does exactly that, so
+    the FIRST click on a toolbar button was silently lost whenever the pointer
+    wasn't already over the toolbar. Reproduced live on 2026-10-12 against a
+    real Prism meeting: a forced first click on 'More' opened nothing (5 of 5
+    other approaches did), which is the 'Polls item never appeared in the More
+    menu' failure — and why a retry usually worked."""
+    try:
+        await locator.hover(force=True, timeout=3000)
+    except Exception:
+        pass
+    await asyncio.sleep(settle)
+    await locator.click(force=True, timeout=5000)
+
+
+async def _bbox_settled(locator, tries: int = 8) -> bool:
+    """True once the element's position has stopped changing (menus animate in;
+    clicking a tile mid-animation hit its neighbour — a Whiteboard dashboard
+    opened instead of Polls). Plain position polling: Playwright's own
+    'stable' check waits for animation frames, which can stall."""
+    last = None
+    for _ in range(tries):
+        try:
+            box = await locator.bounding_box()
+        except Exception:
+            box = None
+        if box and last and abs(box["x"] - last["x"]) < 1 and abs(box["y"] - last["y"]) < 1:
+            return True
+        last = box
+        await asyncio.sleep(0.15)
+    return False
+
+
+async def _more_menu_open(page) -> bool:
+    try:
+        if await page.locator(".more-button__pop-menu").filter(visible=True).count() > 0:
+            return True
+    except Exception:
+        pass
+    return await _visible_polls_control(page) is not None
+
+
+async def _open_more_menu(page):
+    """Click 'More' until its popup is actually showing. A click can be lost
+    (see _hover_click), so success is checked, never assumed — and the button
+    is only clicked again when nothing opened, because More is a toggle."""
+    more_btn = page.locator(_MORE_BTN_SEL).filter(visible=True)
+    if await more_btn.count() == 0:
+        raise RuntimeError("'More' button not found or not visible")
+    for _attempt in range(3):
+        if await _more_menu_open(page):
+            return
+        await _hover_click(page, more_btn.first)
+        for _ in range(8):                      # up to 2 s: the popup animates in
+            await asyncio.sleep(0.25)
+            if await _more_menu_open(page):
+                return
+    raise RuntimeError("clicking 'More' did not open its menu after 3 tries — "
+                       + await _polls_debug(page))
+
+
 async def _open_polls_panel(page):
     """Drive Participants → More → Polls to reveal the Polls/Quizzes
     panel. Idempotent — if the panel is already open, returns
     immediately without re-clicking anything.
 
-    Raises RuntimeError with a *specific* reason for whichever sub-step
-    failed (More button missing, Polls item missing, panel never
-    opened, etc.) so failures are actionable in the Event Log instead of
-    one generic message."""
+    Every click is verified and retried (up to 3 rounds): the More menu must
+    actually show, the Polls tile is clicked only once it has stopped moving,
+    and the panel must actually appear. Raises RuntimeError with a *specific*
+    reason (plus a description of the page) if it can't, so failures are
+    actionable in the Event Log instead of one generic message."""
     if await _polls_panel_visible(page):
         return
 
-    # Step 1: Participants (also ensures the meeting toolbar / side
-    # panel are in a known state).
+    # Participants first (also puts the meeting toolbar / side panel in a
+    # known state).
     await _ensure_participants_panel_open(page)
 
-    # If a visible Polls control already exists — either a direct toolbar
-    # button (wide layouts) or the tile of a "More" menu left open by a
-    # previous failed attempt — use it as-is. More is a *toggle*, so
-    # clicking it again here would close the menu instead of opening it.
-    polls_item = await _visible_polls_control(page)
+    problem = "the Polls item wasn't in the More menu"
+    for _round in range(3):
+        if await _polls_panel_visible(page):
+            return
+        await _open_more_menu(page)        # raises if it can't be opened
 
-    if polls_item is None:
-        # Step 2: More (three-dot menu). Only VISIBLE matches count, and the
-        # Participants side panel has its own "More" button
-        # (aria-label "More managing participants options") that
-        # _MORE_BTN_SEL deliberately excludes.
-        more_btn = page.locator(_MORE_BTN_SEL).filter(visible=True)
-        if await more_btn.count() == 0:
-            raise RuntimeError("'More' button not found or not visible")
-        await more_btn.first.click(force=True)
-        await asyncio.sleep(1)
-
+        polls_item = None
         for _ in range(6):
             polls_item = await _visible_polls_control(page)
             if polls_item is not None:
                 break
             await asyncio.sleep(0.5)
         if polls_item is None:
-            # Say what was actually on the page, so the next failure explains
-            # itself instead of needing a DevTools session to diagnose.
-            try:
-                structured = await page.locator(_POLLS_MENU_ITEM_SEL).count()
-                text_hits = await page.get_by_text(_POLLS_LABEL_RE).count()
-                more_visible = await page.locator(_MORE_BTN_SEL).filter(visible=True).count()
-            except Exception:
-                structured = text_hits = more_visible = -1
-            raise RuntimeError(
-                "'Polls' item never appeared in the More menu after clicking More "
-                f"(none visible; selector matches: {structured}, exact 'Polls' text "
-                f"elements: {text_hits}, visible More buttons: {more_visible})")
+            problem = "the Polls item wasn't in the More menu"
+            continue
 
-    # Step 3: Polls
-    await polls_item.click(force=True)
-    await asyncio.sleep(1)
+        await _bbox_settled(polls_item)
+        await _hover_click(page, polls_item)
+        for _ in range(24):                # up to 6 s for the panel
+            if await _polls_panel_visible(page):
+                return
+            await asyncio.sleep(0.25)
 
-    # Up to ~9 s in total: a busy machine / many open meeting windows can
-    # make the panel appear well after the click.
-    for _ in range(32):
-        if await _polls_panel_visible(page):
-            return
-        await asyncio.sleep(0.25)
-    raise RuntimeError("Polls/Quizzes panel did not open after clicking 'Polls' — "
+        # Not open: the click was lost, or it landed on another tile and a
+        # different dialog opened. Clear whatever is on screen and go again.
+        problem = "clicked Polls but the panel didn't open"
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await asyncio.sleep(0.6)
+
+    raise RuntimeError(f"Polls/Quizzes panel did not open after 3 tries ({problem}) — "
                        + await _polls_debug(page))
 
 
@@ -1832,8 +1931,39 @@ async def _do_launch_poll_once(page, poll_name: str, is_prism: bool = False):
 
     await _click_launch_on_row(page, row)  # raises on failure/ambiguity
 
-    # Best-effort confirmation wait. Zoom doesn't expose a single
-    # reliable DOM marker for "poll is now live" across versions, so we
-    # give the UI a moment to settle rather than asserting on a specific
-    # element.
-    await asyncio.sleep(2)
+    # Verify it actually started: after Launch the panel turns into a poll
+    # view that says "Polling in progress" with an [End Poll] button
+    # (observed live 2026-10-12; for a moment before that it reads "Polling
+    # Closed"). This used to be a blind 2 s sleep, so a lost click was
+    # reported as success.
+    if await _wait_poll_started(page, 9.0):
+        return
+    # Nothing started. If the list is still on screen the click was lost —
+    # click Launch once more; if not, the panel is in some other state.
+    row2 = await _find_poll_row(page, poll_name, is_prism=is_prism)
+    if row2 is not None:
+        await _click_launch_on_row(page, row2)
+        if await _wait_poll_started(page, 9.0):
+            return
+    raise RuntimeError(f"Clicked Launch for '{poll_name}' but the poll never started "
+                       f"(no 'Polling in progress' / 'End Poll' appeared) — " + await _polls_debug(page))
+
+
+async def _poll_started(page) -> bool:
+    for sel in ("button:has-text('End Poll')", "text=/Polling in progress/i"):
+        try:
+            if await page.locator(sel).filter(visible=True).count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _wait_poll_started(page, timeout: float) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if await _poll_started(page):
+            return True
+        await asyncio.sleep(0.4)
+    return False
