@@ -1359,6 +1359,27 @@ class MainWindow(QMainWindow):
         self.log_event(f"Prism link ready: {m.session_name}", "ok")
         return True
 
+    async def _relaunch_session(self, url: str):
+        """Relaunch after the session's window was closed by hand. A Prism
+        start link carries a short-lived host token (ZAK), so the link is
+        fetched again first — reusing the old one could fail once it has
+        expired. If that fetch fails the existing link is used anyway."""
+        m = self.table_model.get(url)
+        if not m:
+            return
+        if m.is_prism() and m.prism_session_id:
+            self.table_model.set_fields(url, status="🟣 Fetching Prism link...", action="...")
+            try:
+                fetched = await fetch_sessions_async([m.prism_session_id])
+                data = fetched.get(m.prism_session_id) or {}
+                fresh = data.get("Start URL") or data.get("Join URL")
+                if fresh and fresh != m.join_url and self.table_model.rekey(url, fresh):
+                    url = fresh
+            except Exception as e:
+                self.log_event(f"Couldn't refresh the Prism link for '{m.session_name}' ({e}) — "
+                               f"relaunching with the existing link.", "warn")
+        self.engine.force_retry(url)
+
     async def _launch_with_prism_fetch_if_needed(self, url: str):
         """Single dispatch point for every launch — Auto Pilot and the
         manual Action-column click both go through this, so the
@@ -1638,7 +1659,9 @@ class MainWindow(QMainWindow):
 
         if col == COL_INDEX["action"]:
             action = m.action or ""
-            if "Launch" in action:
+            if "Relaunch" in action:
+                asyncio.create_task(self._relaunch_session(url))   # window was closed by hand
+            elif "Launch" in action:
                 asyncio.create_task(self._launch_with_prism_fetch_if_needed(url))
             elif "End" in action:
                 if confirm(self, "Confirm End", "Are you sure you want to END this meeting?", danger=True):

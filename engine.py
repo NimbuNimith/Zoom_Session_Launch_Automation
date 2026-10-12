@@ -231,6 +231,7 @@ class Engine:
         self._browser = None
         self._tasks: list[asyncio.Task] = []
         self._browser_not_ready_warned = False
+        self._shutting_down = False
 
     # ── Startup ──────────────────────────────────────────────────────
     async def start(self):
@@ -312,6 +313,7 @@ class Engine:
         down. Giving each step its own short timeout guarantees every
         step at least gets attempted, in order, inside the outer budget.
         """
+        self._shutting_down = True      # window-close events from here on are ours, not the user's
         # 1. Cancel the 3 heartbeat loops and actually wait for them to
         #    finish unwinding — not just fire-and-forget .cancel() — so
         #    none of them can touch a page mid-close below.
@@ -504,6 +506,7 @@ class Engine:
             page = await context.new_page()
             if mode == "HOST":
                 m.page = page
+                self._watch_for_window_close(m, page)
             else:
                 self.guest_pages.append(page)
 
@@ -760,6 +763,7 @@ class Engine:
             )
             page = await context.new_page()
             m.page = page
+            self._watch_for_window_close(m, page)
             await page.route("zoommtg://**", _block_zoom_protocol)
 
             cleaned_url = clean_url(url)
@@ -912,6 +916,7 @@ class Engine:
     def end_session(self, url: str):
         m = self.model.get(url)
         if not m: return
+        m.ending = True
         self.model.set_fields(url, status="🛑 Ending...", action="...")
         self.log(f"Ending session: {m.session_name}", "warn")
         asyncio.create_task(self._end_meeting_task(url))
@@ -942,6 +947,7 @@ class Engine:
         self.log(f"Retry requested: {m.session_name}", "warn")
         m.status = "Pending"
         m.prism_status_pushed = False  # retry resets ALL state, not just launch locks
+        m.ending = False
         self.running_locks.discard(m.lock_key())
         self.model.set_fields(url, status="Pending", action="▶ Launch", retry="")
         if m.is_prism(): self.launch_prism(url)
@@ -1129,6 +1135,69 @@ class Engine:
             self.log(f"Prism status push failed (will retry in ~20s): {m.session_name} — {e}", "err")
 
     # ── Heartbeat loops ──────────────────────────────────────────────
+    # ── Session window closed by hand ───────────────────────────────
+    def _watch_for_window_close(self, m: SessionModel, page):
+        """Playwright fires 'close' when the window/tab goes away for ANY
+        reason. Only a window closed while the row says LIVE is treated as
+        "somebody shut it": the app's own closes (End Session, Clear All, a
+        failed launch, shutdown) happen in other states, and Clear All has
+        already removed the row by then."""
+        def _on_close(*_):
+            asyncio.ensure_future(self._handle_window_closed(m, page))
+        page.on("close", _on_close)
+
+    async def _handle_window_closed(self, m: SessionModel, page):
+        """A LIVE session's browser window was closed by hand. The row used to
+        stay "LIVE" forever (every loop skipped the closed page), the End
+        Session button did nothing, and nothing offered a way back. Now the row
+        says so and offers Relaunch. Safe to call twice: the first call
+        detaches the page, which makes the second one a no-op."""
+        if (m.page is not page or "LIVE" not in m.status or m.ending
+                or self._shutting_down or self.model.get(m.join_url) is not m):
+            return        # not live, or the APP is closing it (End Session / Clear All / shutdown)
+        url = m.join_url
+        m.page = None
+        m.reclaim_host_pending = True
+        self.log(f"Session window was closed: {m.session_name} — it's no longer running. "
+                 f"Click Relaunch to open it again.", "warn")
+        await self.cleanup_session(url)       # frees the launch lock and the Zoom host slot
+        self.model.set_fields(url, status="⚠️ Window Closed", action="▶ Relaunch", poll_action="")
+        try:
+            await page.context.close()        # the now-empty BrowserContext would otherwise linger
+        except Exception:
+            pass
+
+    async def _reclaim_host(self, m: SessionModel):
+        """After a Relaunch: Zoom keeps the closed window's participant around
+        for a while, so the new window joins as a CO-HOST with a "<name> is
+        currently host. [Stay Co-Host] [Reclaim Host]" banner, no End button
+        (End Session then fails) — seen live 2026-10-12. This account IS the
+        host, so click Reclaim Host. Only runs for a relaunch after a closed
+        window; a normal launch never touches that banner."""
+        page = m.page
+        url = m.join_url
+        for _ in range(6):                       # the banner shows up a few seconds after joining
+            await asyncio.sleep(2)
+            if not page or page.is_closed() or m.page is not page:
+                return
+            try:
+                if await page.locator("button[aria-label='End']").filter(visible=True).count() > 0:
+                    return                       # already the host
+                banner = page.locator("button:has-text('Reclaim Host')").filter(visible=True)
+                if await banner.count() > 0:
+                    async with self._page_lock_for(url):
+                        await _hover_click(page, banner.first)
+                    await asyncio.sleep(3)
+                    ok = await page.locator("button[aria-label='End']").filter(visible=True).count() > 0
+                    self.log(f"Reclaimed host in the relaunched window: {m.session_name}" if ok else
+                             f"Clicked 'Reclaim Host' for {m.session_name} but the End button didn't appear.",
+                             "ok" if ok else "warn")
+                    return
+            except Exception:
+                continue
+        self.log(f"Relaunched {m.session_name} but couldn't confirm host status "
+                 f"(no End button and no 'Reclaim Host' banner).", "warn")
+
     async def _fast_live_loop(self):
         """Every 3s. Only End/Leave button checks — cheapest possible DOM
         query — to flip LIVE as fast as possible."""
@@ -1137,8 +1206,11 @@ class Engine:
             if not self.browser_ready: continue
             for m in self.model.all_models():
                 page = m.page
+                if page is not None and page.is_closed() and "LIVE" in m.status:
+                    await self._handle_window_closed(m, page)   # safety net for the close event
+                    continue
                 if not page or page.is_closed(): continue
-                if m.status in LAUNCH_STATUSES: continue
+                if m.status in LAUNCH_STATUSES or m.ending: continue
                 if "LIVE" in m.status: continue
                 try:
                     if await _check_live_buttons(page):
@@ -1148,6 +1220,9 @@ class Engine:
                         if m.is_prism() and not m.prism_status_pushed:
                             asyncio.create_task(self._push_prism_status(m.join_url, m))
                         asyncio.create_task(self._scan_available_polls(m.join_url))
+                        if m.reclaim_host_pending:
+                            m.reclaim_host_pending = False
+                            asyncio.create_task(self._reclaim_host(m))
                 except Exception:
                     pass
 
