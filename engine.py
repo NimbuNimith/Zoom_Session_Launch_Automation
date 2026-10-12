@@ -33,10 +33,33 @@ import sys
 from playwright.async_api import async_playwright
 
 from models import SessionModel, SessionTableModel
-from paths import ensure_stable_chromium, stable_chromium_exe_for
+from browser_setup import required_revision, browser_exe_path, remove_other_revisions
 from prism_status_push import push_prism_live_status_async
 
 MAX_SESSIONS_PER_ACCOUNT = 2
+
+# Zoom's sign-in page sometimes can't reach reCAPTCHA ("Could not connect to the
+# reCAPTCHA service") and the Sign In button then spins forever. Seen on
+# 2026-10-12 with 4 and 2 Zoom sessions launching together: the whole 100 s wait
+# was spent on it, 5 of 6 logins failed. So: only a couple of sign-ins at a time,
+# and when the error persists, reload the sign-in page and try again.
+MAX_CONCURRENT_SIGNINS = 2
+SIGNIN_ATTEMPTS = 3
+RECAPTCHA_ERROR_TEXT = "could not connect to the recaptcha service"
+RECAPTCHA_PERSIST_SECONDS = 8            # error must stay on screen this long before it counts
+
+
+class _RecaptchaUnavailable(Exception):
+    pass
+
+
+class PollNotAvailable(RuntimeError):
+    """The meeting simply doesn't have this Poll (missing, or only a Quiz). A retry
+    would only open and read the same panel again, so none is made. `short` is
+    what the row's Poll column shows."""
+    def __init__(self, message: str, short: str):
+        super().__init__(message)
+        self.short = short
 
 DEFAULT_POLL_NAME = "End Session Poll"   # fallback / default poll to pre-select
 POLL_LAUNCH_MAX_ATTEMPTS = 2             # 1 initial try + 1 retry
@@ -141,6 +164,68 @@ def build_launch_url(mid: str, raw_url: str, mode: str = "start") -> str:
     return base + ("?" + "&".join(params) if params else "")
 
 
+_SIGNIN_SKIP_SEL = ("button:has-text('Skip for now'), a:has-text('Skip for now'), "
+                    "[role='button']:has-text('Skip for now')")
+
+
+async def _skip_signin_interstitial(page) -> bool:
+    """Zoom sometimes inserts a "Sign in faster with your face, fingerprint,
+    or PIN" page (.../signin#/login/bind-passkey) after a correct password.
+    It offers [Next] (create a passkey) and [Skip for now and sign in]; with
+    no one clicking, the sign-in never finishes. Confirmed live 2026-10-09:
+    the first login for each of two accounts stopped there (launch failed),
+    and a manual Retry got through. Clicks "Skip for now" if it is on screen.
+    Returns True if it clicked something."""
+    try:
+        btn = page.locator(_SIGNIN_SKIP_SEL).filter(visible=True).first
+        if await btn.count() == 0:
+            return False
+        await btn.click(timeout=5000)
+        return True
+    except Exception:
+        return False
+
+
+async def _wait_until_signed_in(page, log, timeout: float = 60.0) -> bool:
+    """After submitting the password: wait until the page has left the
+    zoom.us/signin area, skipping the passkey offer if it appears. True once
+    signed in, False if still stuck on a sign-in step after `timeout`."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if "/signin" not in page.url.lower():
+            return True
+        if await _skip_signin_interstitial(page):
+            log("Zoom offered to set up a passkey — skipped it.", "info")
+            await asyncio.sleep(1.5)
+            continue
+        await asyncio.sleep(0.5)
+    return "/signin" not in page.url.lower()
+
+
+async def _save_failure_screenshot(page, folder: str, label: str) -> str:
+    """Screenshot of the meeting page when an automation step fails, saved in
+    the app's data folder (next to the logs folder), so a failure can be diagnosed from
+    what the page actually showed. Returns the path, or "" if it couldn't."""
+    try:
+        from applog import LOG_DIR
+        d = os.path.join(os.path.dirname(LOG_DIR), folder)
+        os.makedirs(d, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", label)[:40] or "session"
+        path = os.path.join(d, f"{safe}_{_now_hhmmss().replace(':', '-')}.png")
+        await page.screenshot(path=path, timeout=8000)
+        return path
+    except Exception:
+        return ""
+
+
+async def _recaptcha_unavailable(page) -> bool:
+    try:
+        return RECAPTCHA_ERROR_TEXT in (await page.inner_text("body", timeout=3000)).lower()
+    except Exception:
+        return False
+
+
 async def _block_zoom_protocol(route):
     # Registered with the route pattern "zoommtg://**" (see call sites),
     # so this only ever fires for that one protocol — every normal
@@ -171,10 +256,13 @@ class Engine:
         self.participant_scraping_enabled = True            # user-facing perf toggle, see set_participant_scraping()
         self._page_locks: dict[str, asyncio.Lock] = {}       # url -> lock, see _page_lock_for()
         self.browser_ready = False
+        self.browser_provider = None   # async (revision) -> chrome.exe path; set by MainWindow
         self._playwright = None
         self._browser = None
         self._tasks: list[asyncio.Task] = []
         self._browser_not_ready_warned = False
+        self._shutting_down = False
+        self._signin_gate = asyncio.Semaphore(MAX_CONCURRENT_SIGNINS)
 
     # ── Startup ──────────────────────────────────────────────────────
     async def start(self):
@@ -196,49 +284,43 @@ class Engine:
         Log panel and the persistent file log."""
         try:
             resolved = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
-            note = resolved if resolved else "<unset — expected; Chromium is bundled, frozen-mode default applies>"
+            note = resolved if resolved else "<unset — expected; the app launches Chromium from its own fixed folder>"
             self.log(f"Starting browser engine — PLAYWRIGHT_BROWSERS_PATH = {note}", "info")
             self._playwright = await async_playwright().start()
             launch_args = ["--deny-permission-prompts", "--window-size=1200,800"]
 
-            # Frozen builds only: run Chromium from a fixed folder instead of
-            # the per-launch %TEMP%\_MEIxxxxxx one, so Windows Firewall sees
-            # the same program every time and asks at most once (see
-            # paths.stable_chromium_dir). Any failure falls back to the
-            # bundled copy — worse (the prompt returns), never fatal.
-            stable_exe = None
+            # Frozen builds only: Chromium is NOT inside the exe (it was 64% of every
+            # update download). It lives in a fixed folder — the installer puts it
+            # there, earlier app versions left a copy there, or it is downloaded
+            # once below — so Windows Firewall also sees the same program every
+            # time and asks at most once (see browser_setup.py).
+            browser_exe = None
             if getattr(sys, "frozen", False):
-                bundled = self._playwright.chromium.executable_path
-                if not os.path.isfile(stable_chromium_exe_for(bundled)):
-                    self.log("Preparing the browser (first launch after an install or "
-                             "update only — this takes a moment)...", "info")
-                stable_exe, why = await asyncio.to_thread(ensure_stable_chromium, bundled)
-                if stable_exe:
-                    self.log(f"Browser runs from a fixed location (Windows Firewall will "
-                             f"only ask once): {stable_exe}", "info")
-                else:
-                    self.log(f"Could not set up the fixed browser location ({why}) — using the "
-                             f"bundled browser (Windows may ask about the firewall again).", "warn")
+                rev = required_revision()
+                browser_exe = browser_exe_path(rev)
+                if not os.path.isfile(browser_exe):
+                    if self.browser_provider is None:
+                        raise RuntimeError("The browser isn't installed and there's no way to "
+                                           "download it. Reinstall using the latest installer.")
+                    self.log("The browser isn't on this computer yet — downloading it once "
+                             "(about 170 MB)...", "info")
+                    browser_exe = await self.browser_provider(rev)
+                await asyncio.to_thread(remove_other_revisions, rev)   # old revisions left by earlier versions
+                self.log(f"Browser runs from a fixed location (Windows Firewall will only "
+                         f"ask once): {browser_exe}", "info")
 
-            try:
-                if stable_exe:
-                    self._browser = await self._playwright.chromium.launch(
-                        headless=False, args=launch_args, executable_path=stable_exe)
-                else:
-                    self._browser = await self._playwright.chromium.launch(
-                        headless=False, args=launch_args)
-            except Exception as e:
-                if not stable_exe:
-                    raise
-                self.log(f"Fixed-location browser failed to start ({e}) — retrying with "
-                         f"the bundled browser.", "warn")
+            if browser_exe:
+                self._browser = await self._playwright.chromium.launch(
+                    headless=False, args=launch_args, executable_path=browser_exe)
+            else:
                 self._browser = await self._playwright.chromium.launch(
                     headless=False, args=launch_args)
         except Exception as e:
             self.log(
                 f"❌ Failed to start the browser engine: {e}. Sessions cannot "
-                f"launch until this is fixed — check that Chromium was "
-                f"installed correctly (see the app's install/setup docs).",
+                f"launch until this is fixed — check your internet connection and "
+                f"restart the app (it will offer to download the browser again), or "
+                f"reinstall using the latest installer.",
                 "err",
             )
             return
@@ -262,6 +344,7 @@ class Engine:
         down. Giving each step its own short timeout guarantees every
         step at least gets attempted, in order, inside the outer budget.
         """
+        self._shutting_down = True      # window-close events from here on are ours, not the user's
         # 1. Cancel the 3 heartbeat loops and actually wait for them to
         #    finish unwinding — not just fire-and-forget .cancel() — so
         #    none of them can touch a page mid-close below.
@@ -400,6 +483,18 @@ class Engine:
             "⚠️ Launch requested but the browser engine isn't ready yet — "
             "check the Event Log above for a startup error.", "warn")
 
+    async def _goto_with_retry(self, page, url: str, label: str):
+        """The meeting page sometimes takes longer than 90 s to load when many
+        sessions open at once (a Prism launch failed on exactly that). One
+        more try costs nothing when it works and saves a manual Retry."""
+        try:
+            await page.goto(url, timeout=90000, wait_until="domcontentloaded")
+        except Exception as e:
+            if "Timeout" not in str(e):
+                raise
+            self.log(f"{label}: the meeting page took over 90 s to load — trying once more.", "warn")
+            await page.goto(url, timeout=90000, wait_until="domcontentloaded")
+
     # ── Launch: Zoom ─────────────────────────────────────────────────
     def launch_zoom(self, url: str):
         if not self.browser_ready:
@@ -454,6 +549,7 @@ class Engine:
             page = await context.new_page()
             if mode == "HOST":
                 m.page = page
+                self._watch_for_window_close(m, page)
             else:
                 self.guest_pages.append(page)
 
@@ -478,137 +574,169 @@ class Engine:
                 SIGNIN_FORM_SEL = "input[name='email'], #email"
                 PASSWORD_FIELD_SEL = "input[name='password'], #password"
                 login_ok = True
-                try:
-                    await page.goto("https://zoom.us/signin", timeout=100000, wait_until="domcontentloaded")
-                    # Zoom's sign-in form is rendered by client-side JS
-                    # AFTER domcontentloaded fires — checking .count()
-                    # instantly can find zero email inputs simply
-                    # because the form hasn't mounted yet, not because
-                    # we're actually logged in. Confirmed live TWICE now:
-                    # first with a zero-wait check, then again with only
-                    # a 5s allowance — under the load conditions seen
-                    # today, page loads have taken 90-100+ seconds (see
-                    # the white-screen timeouts logged earlier), so 5s
-                    # was nowhere near enough margin. Matching the same
-                    # 100s timeout used everywhere else in this function
-                    # costs nothing in the normal case — a genuine
-                    # already-logged-in redirect resolves almost
-                    # instantly — and only matters for the slow case,
-                    # which is exactly the one that was failing.
-                    try:
-                        await page.wait_for_selector(SIGNIN_FORM_SEL, state="attached", timeout=100000)
-                        email_form_present = True
-                    except Exception:
-                        email_form_present = await page.locator(SIGNIN_FORM_SEL).count() > 0
-
-                    if email_form_present:
-                        already_logged_in = False
-                    elif "/signin" not in page.url.lower():
-                        already_logged_in = True
-                    else:
-                        # Email form is gone, but we're still somewhere
-                        # under zoom.us/signin — confirmed live: Zoom can
-                        # redirect through OTHER sign-in sub-steps
-                        # (.../signin#/login/bind-passkey — a passkey
-                        # enrollment prompt) that don't show the email
-                        # field at all. That's not "logged in", and it's
-                        # not the plain email form either — the
-                        # automation has no logic for it, so surface it
-                        # explicitly rather than misreading it as either.
-                        raise RuntimeError(f"stuck on an unhandled sign-in step at {page.url}")
-
-                    if already_logged_in:
-                        self.log(f"Already logged in: {email} (at {page.url})", "ok")
-                    else:
-                        await page.click(SIGNIN_FORM_SEL, timeout=100000)
-                        await asyncio.sleep(0.5)
-                        await page.fill(SIGNIN_FORM_SEL, email)
-                        for _ in range(3):
-                            try:    await page.click("button:has-text('Next')", timeout=100000)
-                            except Exception: pass
+                async with self._signin_gate:
+                    for _signin_attempt in range(1, SIGNIN_ATTEMPTS + 1):
+                        try:
+                            await page.goto("https://zoom.us/signin", timeout=100000, wait_until="domcontentloaded")
+                            # Zoom's sign-in form is rendered by client-side JS
+                            # AFTER domcontentloaded fires — checking .count()
+                            # instantly can find zero email inputs simply
+                            # because the form hasn't mounted yet, not because
+                            # we're actually logged in. Confirmed live TWICE now:
+                            # first with a zero-wait check, then again with only
+                            # a 5s allowance — under the load conditions seen
+                            # today, page loads have taken 90-100+ seconds (see
+                            # the white-screen timeouts logged earlier), so 5s
+                            # was nowhere near enough margin. Matching the same
+                            # 100s timeout used everywhere else in this function
+                            # costs nothing in the normal case — a genuine
+                            # already-logged-in redirect resolves almost
+                            # instantly — and only matters for the slow case,
+                            # which is exactly the one that was failing.
                             try:
+                                await page.wait_for_selector(SIGNIN_FORM_SEL, state="attached", timeout=100000)
+                                email_form_present = True
+                            except Exception:
+                                email_form_present = await page.locator(SIGNIN_FORM_SEL).count() > 0
+
+                            if email_form_present:
+                                already_logged_in = False
+                            elif "/signin" not in page.url.lower():
+                                already_logged_in = True
+                            else:
+                                # Email form is gone, but we're still somewhere
+                                # under zoom.us/signin — confirmed live: Zoom can
+                                # redirect through OTHER sign-in sub-steps
+                                # (.../signin#/login/bind-passkey — a passkey
+                                # enrollment prompt) that don't show the email
+                                # field at all. That's not "logged in", and it's
+                                # not the plain email form either — the
+                                # automation has no logic for it, so surface it
+                                # explicitly rather than misreading it as either.
+                                if await _wait_until_signed_in(page, self.log, timeout=30.0):
+                                    already_logged_in = True
+                                else:
+                                    raise RuntimeError(f"stuck on an unhandled sign-in step at {page.url}")
+
+                            if already_logged_in:
+                                self.log(f"Already logged in: {email} (at {page.url})", "ok")
+                                break
+                            else:
+                                await page.click(SIGNIN_FORM_SEL, timeout=100000)
+                                await asyncio.sleep(0.5)
+                                await page.fill(SIGNIN_FORM_SEL, email)
+                                for _ in range(3):
+                                    try:    await page.click("button:has-text('Next')", timeout=100000)
+                                    except Exception: pass
+                                    try:
+                                        await page.wait_for_selector(
+                                            PASSWORD_FIELD_SEL, state="visible", timeout=100000)
+                                        break
+                                    except Exception:
+                                        await asyncio.sleep(2)
                                 await page.wait_for_selector(
                                     PASSWORD_FIELD_SEL, state="visible", timeout=100000)
-                                break
-                            except Exception:
-                                await asyncio.sleep(2)
-                        await page.wait_for_selector(
-                            PASSWORD_FIELD_SEL, state="visible", timeout=100000)
-                        await page.fill(PASSWORD_FIELD_SEL, password)
-                        await page.click("button:has-text('Sign In'), button:has-text('Sign in')", timeout=100000)
+                                await page.fill(PASSWORD_FIELD_SEL, password)
+                                await page.click("button:has-text('Sign In'), button:has-text('Sign in')", timeout=100000)
 
-                        # Success = the PASSWORD form is GONE *and* we've
-                        # actually left the /signin URL space. Waiting on
-                        # the email selector here (SIGNIN_FORM_SEL) was a
-                        # real bug: the email step is a page ago by this
-                        # point — Zoom's flow is email page -> password
-                        # page, and the email input is already absent the
-                        # moment the password page appears, well before
-                        # Sign In is even clicked. That made the wait
-                        # resolve instantly, so this check was firing
-                        # while Zoom's own Sign In button was still mid-
-                        # submission (its loading spinner visibly still
-                        # spinning in the captured screenshot), reporting
-                        # a false failure on a login that just hadn't
-                        # finished processing yet. Waiting on the
-                        # password field — what's actually still on
-                        # screen right after clicking Sign In — is the
-                        # correct signal for "this specific submission is
-                        # done," whether that ends in success or a real
-                        # failure/passkey step.
-                        try:
-                            await page.wait_for_selector(PASSWORD_FIELD_SEL, state="detached", timeout=100000)
-                            form_gone = True
-                        except Exception:
-                            # A detached-wait can itself time out if Zoom
-                            # merely hides the form instead of removing
-                            # it from the DOM — fall back to a direct
-                            # presence check before concluding failure.
-                            form_gone = await page.locator(PASSWORD_FIELD_SEL).count() == 0
-                        if not form_gone:
-                            raise RuntimeError(
-                                f"still on the password entry page after submitting — stuck at {page.url}")
-                        if "/signin" in page.url.lower():
-                            raise RuntimeError(
-                                f"password form is gone but still stuck somewhere in Zoom's "
-                                f"sign-in flow (e.g. a passkey/verification step) at {page.url}")
-                        self.log(f"Login success: {email} (landed at {page.url})", "ok")
-                except Exception as e:
-                    # Diagnostic capture — a generic "Login failed" line
-                    # alone doesn't say WHERE it got stuck (still on
-                    # sign-in? bounced back after password? a CAPTCHA/
-                    # verification step the selectors don't know about?).
-                    # Grab the current URL, a screenshot, and any visible
-                    # page text so a failure can be diagnosed from the
-                    # log folder without anyone having to be watching
-                    # live when it happens.
-                    current_url = "<unknown>"
-                    try:
-                        current_url = page.url
-                    except Exception:
-                        pass
-                    snippet = ""
-                    try:
-                        body_text = await page.inner_text("body")
-                        snippet = " ".join(body_text.split())[:300]
-                    except Exception:
-                        pass
-                    shot_path = ""
-                    try:
-                        from applog import LOG_DIR
-                        shot_dir = os.path.join(os.path.dirname(LOG_DIR), "login_failures")
-                        os.makedirs(shot_dir, exist_ok=True)
-                        ts = _now_hhmmss().replace(":", "-")
-                        safe_email = email.replace("@", "_at_").replace(".", "_")
-                        shot_path = os.path.join(shot_dir, f"{safe_email}_{ts}.png")
-                        await page.screenshot(path=shot_path, full_page=True)
-                    except Exception:
-                        pass
-                    detail = f"Login failed for {email}: {e} | stuck at: {current_url}"
-                    if shot_path: detail += f" | screenshot: {shot_path}"
-                    if snippet: detail += f" | page text: {snippet}"
-                    self.log(detail, "warn")
-                    login_ok = False
+                                # Success = the PASSWORD form is GONE *and* we've
+                                # actually left the /signin URL space. Waiting on
+                                # the email selector here (SIGNIN_FORM_SEL) was a
+                                # real bug: the email step is a page ago by this
+                                # point — Zoom's flow is email page -> password
+                                # page, and the email input is already absent the
+                                # moment the password page appears, well before
+                                # Sign In is even clicked. That made the wait
+                                # resolve instantly, so this check was firing
+                                # while Zoom's own Sign In button was still mid-
+                                # submission (its loading spinner visibly still
+                                # spinning in the captured screenshot), reporting
+                                # a false failure on a login that just hadn't
+                                # finished processing yet. Waiting on the
+                                # password field — what's actually still on
+                                # screen right after clicking Sign In — is the
+                                # correct signal for "this specific submission is
+                                # done," whether that ends in success or a real
+                                # failure/passkey step.
+                                # Poll instead of one long wait, so Zoom's "Could not
+                                # connect to the reCAPTCHA service" can be told apart
+                                # from a merely slow sign-in and retried early. (A
+                                # detached-wait can also time out if Zoom merely hides
+                                # the form instead of removing it — the presence check
+                                # covers that too.)
+                                loop_clock = asyncio.get_running_loop()
+                                wait_deadline = loop_clock.time() + 100
+                                recaptcha_since = None
+                                form_gone = False
+                                while loop_clock.time() < wait_deadline:
+                                    if await page.locator(PASSWORD_FIELD_SEL).count() == 0:
+                                        form_gone = True
+                                        break
+                                    if await _recaptcha_unavailable(page):
+                                        recaptcha_since = recaptcha_since or loop_clock.time()
+                                        if loop_clock.time() - recaptcha_since >= RECAPTCHA_PERSIST_SECONDS:
+                                            raise _RecaptchaUnavailable()
+                                    else:
+                                        recaptcha_since = None
+                                    await asyncio.sleep(1.0)
+                                if not form_gone:
+                                    raise RuntimeError(
+                                        f"still on the password entry page after submitting — stuck at {page.url}")
+                                if "/signin" in page.url.lower():
+                                    # The passkey offer is skipped here; anything else
+                                    # still counts as stuck once the wait runs out.
+                                    if not await _wait_until_signed_in(page, self.log, timeout=60.0):
+                                        raise RuntimeError(
+                                            f"password form is gone but still stuck somewhere in Zoom's "
+                                            f"sign-in flow (e.g. a verification step) at {page.url}")
+                                self.log(f"Login success: {email} (landed at {page.url})", "ok")
+                                break
+                        except Exception as e:
+                            if isinstance(e, _RecaptchaUnavailable) and _signin_attempt < SIGNIN_ATTEMPTS:
+                                self.log(f"Zoom's reCAPTCHA couldn't connect for {email} — reloading the "
+                                         f"sign-in page (attempt {_signin_attempt + 1} of {SIGNIN_ATTEMPTS}).", "warn")
+                                await asyncio.sleep(random.uniform(2, 5))
+                                continue
+                            if isinstance(e, _RecaptchaUnavailable):
+                                e = RuntimeError("Zoom's reCAPTCHA couldn't be reached on any of "
+                                                 f"{SIGNIN_ATTEMPTS} attempts (page shows 'Could not connect to the "
+                                                 f"reCAPTCHA service')")
+                            # Diagnostic capture — a generic "Login failed" line
+                            # alone doesn't say WHERE it got stuck (still on
+                            # sign-in? bounced back after password? a CAPTCHA/
+                            # verification step the selectors don't know about?).
+                            # Grab the current URL, a screenshot, and any visible
+                            # page text so a failure can be diagnosed from the
+                            # log folder without anyone having to be watching
+                            # live when it happens.
+                            current_url = "<unknown>"
+                            try:
+                                current_url = page.url
+                            except Exception:
+                                pass
+                            snippet = ""
+                            try:
+                                body_text = await page.inner_text("body")
+                                snippet = " ".join(body_text.split())[:300]
+                            except Exception:
+                                pass
+                            shot_path = ""
+                            try:
+                                from applog import LOG_DIR
+                                shot_dir = os.path.join(os.path.dirname(LOG_DIR), "login_failures")
+                                os.makedirs(shot_dir, exist_ok=True)
+                                ts = _now_hhmmss().replace(":", "-")
+                                safe_email = email.replace("@", "_at_").replace(".", "_")
+                                shot_path = os.path.join(shot_dir, f"{safe_email}_{ts}.png")
+                                await page.screenshot(path=shot_path, full_page=True)
+                            except Exception:
+                                pass
+                            detail = f"Login failed for {email}: {e} | stuck at: {current_url}"
+                            if shot_path: detail += f" | screenshot: {shot_path}"
+                            if snippet: detail += f" | page text: {snippet}"
+                            self.log(detail, "warn")
+                            login_ok = False
+                            break
 
                 if not login_ok:
                     # Previously this fell through to page.goto(target)
@@ -633,7 +761,7 @@ class Engine:
             mid = m.zoom_meeting_id() or ""
             target = (f"https://upgrad.zoom.us/wc/{mid}/start"
                       if (mode == "HOST" and email) else f"https://upgrad.zoom.us/wc/{mid}/join")
-            await page.goto(target, timeout=90000, wait_until="domcontentloaded")
+            await self._goto_with_retry(page, target, m.session_name)
 
             try:
                 rescue = page.locator("text=Join from your browser")
@@ -704,6 +832,7 @@ class Engine:
             )
             page = await context.new_page()
             m.page = page
+            self._watch_for_window_close(m, page)
             await page.route("zoommtg://**", _block_zoom_protocol)
 
             cleaned_url = clean_url(url)
@@ -711,7 +840,7 @@ class Engine:
             launch_url = build_launch_url(mid, cleaned_url, mode="start")
 
             self.model.set_fields(url, status="🟣 Opening Prism...", action="...")
-            await page.goto(launch_url, timeout=90000, wait_until="domcontentloaded")
+            await self._goto_with_retry(page, launch_url, m.session_name)
 
             try: await page.keyboard.press("Escape")
             except Exception: pass
@@ -856,6 +985,7 @@ class Engine:
     def end_session(self, url: str):
         m = self.model.get(url)
         if not m: return
+        m.ending = True
         self.model.set_fields(url, status="🛑 Ending...", action="...")
         self.log(f"Ending session: {m.session_name}", "warn")
         asyncio.create_task(self._end_meeting_task(url))
@@ -865,10 +995,9 @@ class Engine:
         if not m or not m.page: return
         try:
             page = m.page
-            try:    await page.click("button:has-text('End')", timeout=5000)
-            except Exception: pass
-            await asyncio.sleep(0.5)
-            await page.click("button:has-text('End Meeting for All')", timeout=5000)
+            if not await _click_end_meeting_for_all(page):
+                raise RuntimeError("'End Meeting for All' never appeared")
+            await asyncio.sleep(1.0)
             await page.close()
             await self.cleanup_session(url)
             self.model.set_fields(url, status="⚫ Ended", action="Closed")
@@ -887,6 +1016,7 @@ class Engine:
         self.log(f"Retry requested: {m.session_name}", "warn")
         m.status = "Pending"
         m.prism_status_pushed = False  # retry resets ALL state, not just launch locks
+        m.ending = False
         self.running_locks.discard(m.lock_key())
         self.model.set_fields(url, status="Pending", action="▶ Launch", retry="")
         if m.is_prism(): self.launch_prism(url)
@@ -990,12 +1120,27 @@ class Engine:
             except Exception as e:
                 last_err = e
                 self.log(f"{prefix}[POLL] attempt {attempt} failed for '{m.session_name}': {e}", "warn")
+                if isinstance(e, PollNotAvailable):
+                    break             # the meeting doesn't have it; trying again can't change that
                 if attempt < POLL_LAUNCH_MAX_ATTEMPTS:
                     await asyncio.sleep(2)
 
         m.poll_launching = False
-        self.model.set_fields(url, poll_status=f"{prefix}Failed", poll_action="Launch Poll")
-        self.log(f"{prefix}Poll launch failed for '{m.session_name}': {last_err}", "err")
+        short = getattr(last_err, "short", "Failed")
+        self.model.set_fields(url, poll_status=f"{prefix}{short}", poll_action="Launch Poll")
+        detail = f"{prefix}Poll launch failed for '{m.session_name}': {last_err}"
+        shot = await _save_failure_screenshot(m.page, "poll_failures", m.session_name)
+        if shot:
+            detail += f" | screenshot: {shot}"
+        self.log(detail, "err")
+        # Don't leave the Polls window sitting open over the meeting after a failure
+        # (it looked like the session was "stuck" on the poll list).
+        try:
+            if m.page and not m.page.is_closed():
+                async with self._page_lock_for(url):
+                    await _close_polls_panel(m.page)
+        except Exception:
+            pass
         return False
 
     async def launch_poll_for_many(self, urls: list):
@@ -1070,6 +1215,69 @@ class Engine:
             self.log(f"Prism status push failed (will retry in ~20s): {m.session_name} — {e}", "err")
 
     # ── Heartbeat loops ──────────────────────────────────────────────
+    # ── Session window closed by hand ───────────────────────────────
+    def _watch_for_window_close(self, m: SessionModel, page):
+        """Playwright fires 'close' when the window/tab goes away for ANY
+        reason. Only a window closed while the row says LIVE is treated as
+        "somebody shut it": the app's own closes (End Session, Clear All, a
+        failed launch, shutdown) happen in other states, and Clear All has
+        already removed the row by then."""
+        def _on_close(*_):
+            asyncio.ensure_future(self._handle_window_closed(m, page))
+        page.on("close", _on_close)
+
+    async def _handle_window_closed(self, m: SessionModel, page):
+        """A LIVE session's browser window was closed by hand. The row used to
+        stay "LIVE" forever (every loop skipped the closed page), the End
+        Session button did nothing, and nothing offered a way back. Now the row
+        says so and offers Relaunch. Safe to call twice: the first call
+        detaches the page, which makes the second one a no-op."""
+        if (m.page is not page or "LIVE" not in m.status or m.ending
+                or self._shutting_down or self.model.get(m.join_url) is not m):
+            return        # not live, or the APP is closing it (End Session / Clear All / shutdown)
+        url = m.join_url
+        m.page = None
+        m.reclaim_host_pending = True
+        self.log(f"Session window was closed: {m.session_name} — it's no longer running. "
+                 f"Click Relaunch to open it again.", "warn")
+        await self.cleanup_session(url)       # frees the launch lock and the Zoom host slot
+        self.model.set_fields(url, status="⚠️ Window Closed", action="▶ Relaunch", poll_action="")
+        try:
+            await page.context.close()        # the now-empty BrowserContext would otherwise linger
+        except Exception:
+            pass
+
+    async def _reclaim_host(self, m: SessionModel):
+        """After a Relaunch: Zoom keeps the closed window's participant around
+        for a while, so the new window joins as a CO-HOST with a "<name> is
+        currently host. [Stay Co-Host] [Reclaim Host]" banner, no End button
+        (End Session then fails) — seen live 2026-10-12. This account IS the
+        host, so click Reclaim Host. Only runs for a relaunch after a closed
+        window; a normal launch never touches that banner."""
+        page = m.page
+        url = m.join_url
+        for _ in range(6):                       # the banner shows up a few seconds after joining
+            await asyncio.sleep(2)
+            if not page or page.is_closed() or m.page is not page:
+                return
+            try:
+                if await page.locator("button[aria-label='End']").filter(visible=True).count() > 0:
+                    return                       # already the host
+                banner = page.locator("button:has-text('Reclaim Host')").filter(visible=True)
+                if await banner.count() > 0:
+                    async with self._page_lock_for(url):
+                        await _hover_click(page, banner.first)
+                    await asyncio.sleep(3)
+                    ok = await page.locator("button[aria-label='End']").filter(visible=True).count() > 0
+                    self.log(f"Reclaimed host in the relaunched window: {m.session_name}" if ok else
+                             f"Clicked 'Reclaim Host' for {m.session_name} but the End button didn't appear.",
+                             "ok" if ok else "warn")
+                    return
+            except Exception:
+                continue
+        self.log(f"Relaunched {m.session_name} but couldn't confirm host status "
+                 f"(no End button and no 'Reclaim Host' banner).", "warn")
+
     async def _fast_live_loop(self):
         """Every 3s. Only End/Leave button checks — cheapest possible DOM
         query — to flip LIVE as fast as possible."""
@@ -1078,8 +1286,11 @@ class Engine:
             if not self.browser_ready: continue
             for m in self.model.all_models():
                 page = m.page
+                if page is not None and page.is_closed() and "LIVE" in m.status:
+                    await self._handle_window_closed(m, page)   # safety net for the close event
+                    continue
                 if not page or page.is_closed(): continue
-                if m.status in LAUNCH_STATUSES: continue
+                if m.status in LAUNCH_STATUSES or m.ending: continue
                 if "LIVE" in m.status: continue
                 try:
                     if await _check_live_buttons(page):
@@ -1089,6 +1300,9 @@ class Engine:
                         if m.is_prism() and not m.prism_status_pushed:
                             asyncio.create_task(self._push_prism_status(m.join_url, m))
                         asyncio.create_task(self._scan_available_polls(m.join_url))
+                        if m.reclaim_host_pending:
+                            m.reclaim_host_pending = False
+                            asyncio.create_task(self._reclaim_host(m))
                 except Exception:
                     pass
 
@@ -1298,16 +1512,28 @@ async def _find_meeting_context(page):
 
 
 async def _ensure_participants_panel_open(ctx) -> bool:
+    panel_sel = "text=/Participants\\s*\\(\\d+\\)/"
+
+    async def panel_open() -> bool:
+        try:
+            return (await ctx.locator(panel_sel).count() > 0
+                    and await ctx.locator(panel_sel).first.is_visible(timeout=1500))
+        except Exception:
+            return False
+
     try:
-        panel_sel = "text=/Participants\\s*\\(\\d+\\)/"
-        if await ctx.locator(panel_sel).count() > 0:
-            if await ctx.locator(panel_sel).first.is_visible(timeout=1500):
-                return True
+        if await panel_open():
+            return True
         btn = ctx.locator(_PARTICIPANTS_BTN_SEL)
         if await btn.count() > 0 and await btn.first.is_visible(timeout=2000):
-            await btn.first.click(force=True)
-            await asyncio.sleep(1)
-            return True
+            # Verified, not assumed: a lost first click (see _hover_click) used to
+            # leave the panel closed while this reported success.
+            for _attempt in range(2):
+                await _hover_click(ctx, btn.first)
+                for _ in range(6):
+                    await asyncio.sleep(0.25)
+                    if await panel_open():
+                        return True
     except Exception:
         pass
     return False
@@ -1413,67 +1639,202 @@ async def _visible_polls_control(page):
     return None
 
 
+async def _polls_panel_visible(page) -> bool:
+    """Is the Polls/Quizzes panel actually on screen? Only VISIBLE matches
+    count. The old check took `.first` of a plain text match, and Zoom can
+    keep an invisible copy of the same text earlier in the page; then an
+    open panel was treated as closed, 'Polls' was clicked again (it is a
+    toggle, so that CLOSED the panel) and the wait for it to appear failed:
+    "Polls/Quizzes panel did not open after clicking 'Polls'"."""
+    for sel in ("[aria-label='Polls/Quizzes']", _POLLS_PANEL_TITLE_SEL):
+        try:
+            if await page.locator(sel).filter(visible=True).count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _polls_debug(page) -> str:
+    """One line describing what the page looks like, appended to poll errors
+    so a failure explains itself."""
+    try:
+        info = await page.evaluate("""() => ({
+            vis: document.visibilityState,
+            size: innerWidth + 'x' + innerHeight,
+            dialogs: Array.from(document.querySelectorAll('[role=dialog],[aria-modal=true],.ReactModal__Content'))
+                .map(e => (e.getAttribute('aria-label') || e.className || e.tagName).toString().slice(0, 40)).slice(0, 6),
+        })""")
+        attached = await page.locator(_POLLS_PANEL_TITLE_SEL).count()
+        visible = await page.locator(_POLLS_PANEL_TITLE_SEL).filter(visible=True).count()
+        return (f"page {info.get('size')}, visibility={info.get('vis')}, "
+                f"'Polls/Quizzes' text matches: {attached} attached / {visible} visible, "
+                f"dialogs on page: {info.get('dialogs') or 'none'}")
+    except Exception as ex:
+        return f"(could not inspect the page: {type(ex).__name__})"
+
+
+async def _click_end_meeting_for_all(page) -> bool:
+    """End → End Meeting for All. The first click on End is lost like any other
+    first toolbar click (see _hover_click) and used to be skipped with `except:
+    pass`, after which the missing 'End Meeting for All' button made the whole
+    thing fall through to 'Force Closed' with the meeting still running.
+    Returns True once 'End Meeting for All' has been clicked.
+
+    The floating Polls/Quizzes window (open right after Auto-Pilot launches a
+    poll) sits over the toolbar, and with it open clicking End opened nothing
+    at all (verified live 2026-10-12, three tries) — so it is closed first."""
+    if await _polls_panel_visible(page):
+        await _close_polls_panel(page)
+        await asyncio.sleep(0.6)
+    for _attempt in range(3):
+        # The toolbar's End button is aria-label="End". Matching on text alone
+        # also catches "End Poll" (visible whenever a poll is running or its
+        # panel is open) and, being earlier in the page, got clicked instead.
+        end = page.locator("button[aria-label='End']").filter(visible=True)
+        if await end.count() == 0:
+            end = page.get_by_role("button", name=re.compile(r"^\s*End\s*$")).filter(visible=True)
+        if await end.count() == 0:
+            end = page.locator("button:has-text('End')").filter(visible=True).filter(has_not_text="Poll")
+        if await end.count() == 0:
+            return False
+        await _hover_click(page, end.first)
+        target = page.get_by_text("End Meeting for All", exact=False).filter(visible=True)
+        for _ in range(8):
+            await asyncio.sleep(0.25)
+            if await target.count() > 0:
+                await _hover_click(page, target.first, settle=0.3)
+                return True
+    return False
+
+
+async def _hover_click(page, locator, settle: float = 0.45):
+    """Click a control in Zoom's meeting toolbar the way a person does: put the
+    pointer on it, give the toolbar a moment to react, then click.
+
+    Zoom's footer buttons (More, End, Participants...) ignore a click that
+    arrives together with the pointer's first move onto them — the hover
+    re-renders the button, the press and release land on different nodes, and
+    no click fires. Playwright's click (forced or not) does exactly that, so
+    the FIRST click on a toolbar button was silently lost whenever the pointer
+    wasn't already over the toolbar. Reproduced live on 2026-10-12 against a
+    real Prism meeting: a forced first click on 'More' opened nothing (5 of 5
+    other approaches did), which is the 'Polls item never appeared in the More
+    menu' failure — and why a retry usually worked."""
+    try:
+        await locator.hover(force=True, timeout=3000)
+    except Exception:
+        pass
+    await asyncio.sleep(settle)
+    try:
+        await locator.click(force=True, timeout=5000)
+    except Exception as e:
+        # Playwright reports a click as failed when the page is still "waiting for
+        # scheduled navigations to finish" afterwards — on a busy page that wait
+        # overran 5 s and failed poll launches whose click had in fact gone through
+        # ("click action done" is in the error). The result is checked by the callers.
+        if "click action done" in str(e):
+            return
+        raise
+
+
+async def _bbox_settled(locator, tries: int = 8) -> bool:
+    """True once the element's position has stopped changing (menus animate in;
+    clicking a tile mid-animation hit its neighbour — a Whiteboard dashboard
+    opened instead of Polls). Plain position polling: Playwright's own
+    'stable' check waits for animation frames, which can stall."""
+    last = None
+    for _ in range(tries):
+        try:
+            box = await locator.bounding_box()
+        except Exception:
+            box = None
+        if box and last and abs(box["x"] - last["x"]) < 1 and abs(box["y"] - last["y"]) < 1:
+            return True
+        last = box
+        await asyncio.sleep(0.15)
+    return False
+
+
+async def _more_menu_open(page) -> bool:
+    try:
+        if await page.locator(".more-button__pop-menu").filter(visible=True).count() > 0:
+            return True
+    except Exception:
+        pass
+    return await _visible_polls_control(page) is not None
+
+
+async def _open_more_menu(page):
+    """Click 'More' until its popup is actually showing. A click can be lost
+    (see _hover_click), so success is checked, never assumed — and the button
+    is only clicked again when nothing opened, because More is a toggle."""
+    more_btn = page.locator(_MORE_BTN_SEL).filter(visible=True)
+    if await more_btn.count() == 0:
+        raise RuntimeError("'More' button not found or not visible")
+    for _attempt in range(3):
+        if await _more_menu_open(page):
+            return
+        await _hover_click(page, more_btn.first)
+        for _ in range(8):                      # up to 2 s: the popup animates in
+            await asyncio.sleep(0.25)
+            if await _more_menu_open(page):
+                return
+    raise RuntimeError("clicking 'More' did not open its menu after 3 tries — "
+                       + await _polls_debug(page))
+
+
 async def _open_polls_panel(page):
     """Drive Participants → More → Polls to reveal the Polls/Quizzes
     panel. Idempotent — if the panel is already open, returns
     immediately without re-clicking anything.
 
-    Raises RuntimeError with a *specific* reason for whichever sub-step
-    failed (More button missing, Polls item missing, panel never
-    opened, etc.) so failures are actionable in the Event Log instead of
-    one generic message."""
-    if await page.locator(_POLLS_PANEL_TITLE_SEL).count() > 0:
-        if await page.locator(_POLLS_PANEL_TITLE_SEL).first.is_visible(timeout=1000):
-            return
+    Every click is verified and retried (up to 3 rounds): the More menu must
+    actually show, the Polls tile is clicked only once it has stopped moving,
+    and the panel must actually appear. Raises RuntimeError with a *specific*
+    reason (plus a description of the page) if it can't, so failures are
+    actionable in the Event Log instead of one generic message."""
+    if await _polls_panel_visible(page):
+        return
 
-    # Step 1: Participants (also ensures the meeting toolbar / side
-    # panel are in a known state).
+    # Participants first (also puts the meeting toolbar / side panel in a
+    # known state).
     await _ensure_participants_panel_open(page)
 
-    # If a visible Polls control already exists — either a direct toolbar
-    # button (wide layouts) or the tile of a "More" menu left open by a
-    # previous failed attempt — use it as-is. More is a *toggle*, so
-    # clicking it again here would close the menu instead of opening it.
-    polls_item = await _visible_polls_control(page)
+    problem = "the Polls item wasn't in the More menu"
+    for _round in range(3):
+        if await _polls_panel_visible(page):
+            return
+        await _open_more_menu(page)        # raises if it can't be opened
 
-    if polls_item is None:
-        # Step 2: More (three-dot menu). Only VISIBLE matches count, and the
-        # Participants side panel has its own "More" button
-        # (aria-label "More managing participants options") that
-        # _MORE_BTN_SEL deliberately excludes.
-        more_btn = page.locator(_MORE_BTN_SEL).filter(visible=True)
-        if await more_btn.count() == 0:
-            raise RuntimeError("'More' button not found or not visible")
-        await more_btn.first.click(force=True)
-        await asyncio.sleep(1)
-
+        polls_item = None
         for _ in range(6):
             polls_item = await _visible_polls_control(page)
             if polls_item is not None:
                 break
             await asyncio.sleep(0.5)
         if polls_item is None:
-            # Say what was actually on the page, so the next failure explains
-            # itself instead of needing a DevTools session to diagnose.
-            try:
-                structured = await page.locator(_POLLS_MENU_ITEM_SEL).count()
-                text_hits = await page.get_by_text(_POLLS_LABEL_RE).count()
-                more_visible = await page.locator(_MORE_BTN_SEL).filter(visible=True).count()
-            except Exception:
-                structured = text_hits = more_visible = -1
-            raise RuntimeError(
-                "'Polls' item never appeared in the More menu after clicking More "
-                f"(none visible; selector matches: {structured}, exact 'Polls' text "
-                f"elements: {text_hits}, visible More buttons: {more_visible})")
+            problem = "the Polls item wasn't in the More menu"
+            continue
 
-    # Step 3: Polls
-    await polls_item.click(force=True)
-    await asyncio.sleep(1)
+        await _bbox_settled(polls_item)
+        await _hover_click(page, polls_item)
+        for _ in range(24):                # up to 6 s for the panel
+            if await _polls_panel_visible(page):
+                return
+            await asyncio.sleep(0.25)
 
-    try:
-        await page.locator(_POLLS_PANEL_TITLE_SEL).first.wait_for(state="visible", timeout=5000)
-    except Exception:
-        raise RuntimeError("Polls/Quizzes panel did not open after clicking 'Polls'")
+        # Not open: the click was lost, or it landed on another tile and a
+        # different dialog opened. Clear whatever is on screen and go again.
+        problem = "clicked Polls but the panel didn't open"
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await asyncio.sleep(0.6)
+
+    raise RuntimeError(f"Polls/Quizzes panel did not open after 3 tries ({problem}) — "
+                       + await _polls_debug(page))
 
 
 async def _is_quiz_entry(title_loc) -> bool:
@@ -1676,7 +2037,18 @@ async def _click_launch_on_row(page, title_loc) -> bool:
     own row into a container spanning multiple rows, and the fallback
     then clicked an unrelated poll's Launch button ('Academic writing
     session' launched instead of 'End Session Poll')."""
-    await title_loc.scroll_into_view_if_needed(timeout=2000)
+    try:
+        await title_loc.scroll_into_view_if_needed(timeout=2000)
+    except Exception:
+        # Playwright waits for the element to hold still between two frames;
+        # a row that keeps re-rendering (or a page that is slow to paint)
+        # never does, and a poll launch failed with "waiting for element to be
+        # stable" even though the row was right there. Scrolling it into view
+        # directly needs no such wait, and the hover/click below are forced.
+        try:
+            await title_loc.evaluate("el => el.scrollIntoView({block: 'center', inline: 'nearest'})")
+        except Exception:
+            pass
     await title_loc.hover(force=True)
     await asyncio.sleep(0.5)
 
@@ -1712,19 +2084,68 @@ async def _do_launch_poll_once(page, poll_name: str, is_prism: bool = False):
 
     row = await _find_poll_row(page, poll_name, is_prism=is_prism)
     if row is None:
-        # Say what the panel actually showed, so a failure explains itself.
-        try:
-            present = [t.strip() for t in await page.locator(".poll-list-item__topic-name").all_inner_texts()]
-        except Exception:
-            present = []
-        raise RuntimeError(
-            f"Poll '{poll_name}' was not found in the list "
-            f"(entries in the panel: {present if present else 'none'})")
+        polls, quizzes = await _poll_and_quiz_titles(page)
+        listing = (f"Polls in this meeting: {polls if polls else 'none'}"
+                   + (f"; Quizzes: {quizzes}" if quizzes else ""))
+        if poll_name.casefold() in {q.casefold() for q in quizzes}:
+            # Seen 2026-10-12: 'End Session Poll' was a Quiz in a real meeting, and
+            # "was not found in the list" sent people looking for a missing poll.
+            raise PollNotAvailable(
+                f"'{poll_name}' exists in this meeting only as a Quiz, and Command Center "
+                f"launches Polls only. {listing}. Pick one of the Polls in this row's "
+                f"Poll Select dropdown, or recreate '{poll_name}' as a Poll.", "Failed: is a quiz")
+        raise PollNotAvailable(
+            f"There is no Poll named '{poll_name}' in this meeting. {listing}. "
+            f"Pick one of those in this row's Poll Select dropdown if one fits.", "Failed: not found")
 
     await _click_launch_on_row(page, row)  # raises on failure/ambiguity
 
-    # Best-effort confirmation wait. Zoom doesn't expose a single
-    # reliable DOM marker for "poll is now live" across versions, so we
-    # give the UI a moment to settle rather than asserting on a specific
-    # element.
-    await asyncio.sleep(2)
+    # Verify it actually started: after Launch the panel turns into a poll
+    # view that says "Polling in progress" with an [End Poll] button
+    # (observed live 2026-10-12; for a moment before that it reads "Polling
+    # Closed"). This used to be a blind 2 s sleep, so a lost click was
+    # reported as success.
+    if await _wait_poll_started(page, 9.0):
+        return
+    # Nothing started. If the list is still on screen the click was lost —
+    # click Launch once more; if not, the panel is in some other state.
+    row2 = await _find_poll_row(page, poll_name, is_prism=is_prism)
+    if row2 is not None:
+        await _click_launch_on_row(page, row2)
+        if await _wait_poll_started(page, 9.0):
+            return
+    raise RuntimeError(f"Clicked Launch for '{poll_name}' but the poll never started "
+                       f"(no 'Polling in progress' / 'End Poll' appeared) — " + await _polls_debug(page))
+
+
+async def _poll_and_quiz_titles(page):
+    """(poll titles, quiz titles) currently listed in the open Polls/Quizzes panel."""
+    try:
+        rows = await page.evaluate("""() => Array.from(document.querySelectorAll('.poll-list-item')).map(r => ({
+            n: ((r.querySelector('.poll-list-item__topic-name') || {}).innerText || '').trim(),
+            d: ((r.querySelector('.poll-list-item__detail') || {}).innerText || '').trim()}))""")
+    except Exception:
+        return [], []
+    polls = [r["n"] for r in rows if r["n"] and re.match(r"^\s*Poll\b", r["d"], re.IGNORECASE)]
+    quizzes = [r["n"] for r in rows if r["n"] and re.match(r"^\s*Quiz\b", r["d"], re.IGNORECASE)]
+    return polls, quizzes
+
+
+async def _poll_started(page) -> bool:
+    for sel in ("button:has-text('End Poll')", "text=/Polling in progress/i"):
+        try:
+            if await page.locator(sel).filter(visible=True).count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _wait_poll_started(page, timeout: float) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if await _poll_started(page):
+            return True
+        await asyncio.sleep(0.4)
+    return False

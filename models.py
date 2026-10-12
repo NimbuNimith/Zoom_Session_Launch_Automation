@@ -61,6 +61,8 @@ class SessionModel:
     poll_auto_triggered: bool = False       # one-shot guard for the Auto-Pilot near-End-Time trigger
     available_polls: list = field(default_factory=list)   # Poll-type titles found at the LIVE transition; empty = scan not run / failed
     selected_poll: str = ""                 # "" = use the default poll; else the row's chosen poll title
+    ending: bool = False                    # End Session in progress: the app itself is about to close the window
+    reclaim_host_pending: bool = False      # set when the window was closed by hand: the relaunch may join as co-host
 
     def is_zoom(self) -> bool:  return self.session_type == "ZOOM"
     def is_prism(self) -> bool: return self.session_type == "PRISM"

@@ -42,6 +42,7 @@ from models import SessionModel, SessionTableModel, COL_INDEX
 from engine import Engine, DEFAULT_POLL_NAME, AUTO_POLL_END_MINUTES
 from prism_data_pull import fetch_sessions_async
 from paths import resource_path
+from hard_exit import hard_exit
 from applog import log_to_file, LOG_DIR
 from app_settings import get_settings
 from gsheets_api_client import GSheetsAPIClient, GSheetsError
@@ -186,7 +187,8 @@ def _fmt_eta(seconds: float) -> str:
 
 
 class UpdateProgressDialog(QDialog):
-    """Shown while an app update downloads (see updater.py). Same look as
+    """Shown while an app update (updater.py) or the one-time browser
+    download (browser_ui.py) runs. Same look as
     _StyledDialog, but it has to stay alive and be updated while the
     download runs, which _StyledDialog's build-once layout can't do.
 
@@ -195,10 +197,11 @@ class UpdateProgressDialog(QDialog):
 
     cancel_requested = Signal()
 
-    def __init__(self, parent, new_version: str):
+    def __init__(self, parent, new_version: str = "", heading: str = None,
+                 message: str = None, window_title: str = "Downloading Update"):
         super().__init__(parent)
         self._finished = False
-        self.setWindowTitle("Downloading Update")
+        self.setWindowTitle(window_title)
         self.setWindowIcon(_app_icon())
         self.setMinimumWidth(420)
         self.setModal(True)
@@ -208,11 +211,11 @@ class UpdateProgressDialog(QDialog):
         v.setContentsMargins(20, 18, 20, 16)
         v.setSpacing(12)
 
-        title_lbl = QLabel(f"Downloading v{new_version}")
+        title_lbl = QLabel(heading or f"Downloading v{new_version}")
         title_lbl.setStyleSheet(f"font-size: 13px; font-weight: 700; color: {theme.INK};")
         v.addWidget(title_lbl)
 
-        msg_lbl = QLabel("The app will restart automatically when the download finishes.")
+        msg_lbl = QLabel(message or "The app will restart automatically when the download finishes.")
         msg_lbl.setWordWrap(True)
         msg_lbl.setStyleSheet(f"font-size: 11px; color: {theme.MUTED};")
         v.addWidget(msg_lbl)
@@ -253,6 +256,12 @@ class UpdateProgressDialog(QDialog):
             text = f"{_fmt_mb(done)} downloaded"
             if speed > 0:
                 text += f"  ·  {speed / (1024 * 1024):.1f} MB/s"
+        self.detail.setText(text)
+
+    @Slot(str)
+    def set_status(self, text: str):
+        """A step with no byte count (e.g. unpacking): indeterminate bar + text."""
+        self.bar.setRange(0, 0)
         self.detail.setText(text)
 
     def finish(self):
@@ -734,6 +743,10 @@ class MainWindow(QMainWindow):
 
         self.table_model = SessionTableModel()
         self.engine = Engine(self.table_model, self.log_event)
+        # Only used when the browser isn't already on disk (the installer normally
+        # puts it there) — see browser_setup.py / browser_ui.py.
+        from browser_ui import provide_browser
+        self.engine.browser_provider = lambda rev: provide_browser(self, rev)
         self.auto_pilot_running = False
         self._auto_pilot_timer = QTimer(self)
         self._auto_pilot_timer.setInterval(10_000)
@@ -863,8 +876,12 @@ class MainWindow(QMainWindow):
         #
         # 8s budget = the 5s graceful-shutdown timeout below + buffer
         # for quit() itself and normal interpreter teardown.
+        #
+        # hard_exit(), not os._exit(): os._exit crashed pyside6.abi3.dll
+        # when it fired while the main thread was still closing the event
+        # loop (see hard_exit.py).
         threading.Thread(
-            target=lambda: (_time.sleep(8), os._exit(0)), daemon=True
+            target=lambda: (_time.sleep(8), hard_exit(0)), daemon=True
         ).start()
         asyncio.ensure_future(self._shutdown_and_quit())
 
@@ -889,7 +906,7 @@ class MainWindow(QMainWindow):
             # wait around for the safety-net thread to bail us out — we
             # already know the clean path failed.
             print(f"quit() failed: {e}")
-            os._exit(0)
+            hard_exit(0)
 
     # ── UI construction ──────────────────────────────────────────────
     def _build_ui(self):
@@ -928,7 +945,7 @@ class MainWindow(QMainWindow):
                             ("cohosts", 180), ("participant_count", 100),
                             ("launched_at", 100), ("status", 190),
                             ("action", 130), ("retry", 90),
-                            ("poll_status", 110), ("poll_select", 190), ("poll_action", 130),
+                            ("poll_status", 140), ("poll_select", 190), ("poll_action", 130),
                             ("prism_type", 150), ("prism_sync", 160),
                             ("session_id", 160), ("meeting_code", 110)]:
             self.table.setColumnWidth(COL_INDEX[key], width)
@@ -1342,6 +1359,27 @@ class MainWindow(QMainWindow):
         self.log_event(f"Prism link ready: {m.session_name}", "ok")
         return True
 
+    async def _relaunch_session(self, url: str):
+        """Relaunch after the session's window was closed by hand. A Prism
+        start link carries a short-lived host token (ZAK), so the link is
+        fetched again first — reusing the old one could fail once it has
+        expired. If that fetch fails the existing link is used anyway."""
+        m = self.table_model.get(url)
+        if not m:
+            return
+        if m.is_prism() and m.prism_session_id:
+            self.table_model.set_fields(url, status="🟣 Fetching Prism link...", action="...")
+            try:
+                fetched = await fetch_sessions_async([m.prism_session_id])
+                data = fetched.get(m.prism_session_id) or {}
+                fresh = data.get("Start URL") or data.get("Join URL")
+                if fresh and fresh != m.join_url and self.table_model.rekey(url, fresh):
+                    url = fresh
+            except Exception as e:
+                self.log_event(f"Couldn't refresh the Prism link for '{m.session_name}' ({e}) — "
+                               f"relaunching with the existing link.", "warn")
+        self.engine.force_retry(url)
+
     async def _launch_with_prism_fetch_if_needed(self, url: str):
         """Single dispatch point for every launch — Auto Pilot and the
         manual Action-column click both go through this, so the
@@ -1621,7 +1659,9 @@ class MainWindow(QMainWindow):
 
         if col == COL_INDEX["action"]:
             action = m.action or ""
-            if "Launch" in action:
+            if "Relaunch" in action:
+                asyncio.create_task(self._relaunch_session(url))   # window was closed by hand
+            elif "Launch" in action:
                 asyncio.create_task(self._launch_with_prism_fetch_if_needed(url))
             elif "End" in action:
                 if confirm(self, "Confirm End", "Are you sure you want to END this meeting?", danger=True):

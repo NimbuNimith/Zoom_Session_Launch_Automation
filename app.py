@@ -64,6 +64,7 @@ qasync_patch.patch()
 from main_window import MainWindow
 from updater import check_for_update
 from paths import resource_path
+from hard_exit import hard_exit
 from prism_token import refresh_token
 from single_instance import try_acquire_or_notify_existing, wire_activation_to_window
 from splash import show_splash
@@ -127,6 +128,14 @@ def main():
         loop.create_task(refresh_token(log_fn=window.log_event))
         loop.create_task(window.engine.start())
         loop.run_forever()
+        # run_forever() returns once the window's closeEvent has shut the engine
+        # down and called quit(). End the process here instead of letting
+        # `with loop:` close the event loop: closing it waits on outstanding
+        # I/O (the Playwright driver's pipes) for as long as it takes, which
+        # is what the 8 s safety-net thread in MainWindow.closeEvent was
+        # killing the process in the middle of — crashing pyside6.abi3.dll
+        # on every auto-update. See hard_exit.py.
+        hard_exit(0, sync_settings=True)
 
 
 if __name__ == "__main__":

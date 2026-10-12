@@ -5,57 +5,34 @@
 # command. Everything else about your release process (bump version ->
 # build -> GitHub Release -> update version.txt) stays the same.
 #
-# Build with:
-#     pyinstaller Zoom_Ai_latest.spec --noconfirm --clean
-# (--clean matters here more than usual — see the REQUIRED BUILD STEP
-# below; a stale build/ cache can otherwise hide whether Chromium
-# actually got bundled on a given build.)
+# Build with:  pyinstaller Zoom_Ai_latest.spec --noconfirm
+# (see the notes below before building a release)
 #
-# CHROMIUM IS NOW BUNDLED INTO THE EXE — reversing an earlier decision.
+# CHROMIUM IS NOT BUNDLED INTO THE EXE (as of 2.5.0)
 # -----------------------------------------------------------------------
-# An earlier version of this file deliberately did NOT bundle Chromium,
-# instead installing it once via the installer into an external cache
-# (or later, a persistent %LOCALAPPDATA% folder), specifically to keep
-# every future auto-update small (see updater.py — Zoom_Ai_latest.exe is
-# what gets re-downloaded on EVERY update, not just first install).
+# Chromium used to be bundled into the exe, which made it ~435 MB and made
+# every auto-update re-download all of it — 64% of the file, for something
+# that almost never changes — and made every launch unpack ~1 GB into
+# %TEMP%. It now lives in one fixed folder per Chromium revision:
+#     %LOCALAPPDATA%\Command Center\chromium\chromium-<rev>\chrome-win64\
+# put there by the installer (installer.iss), by earlier app versions
+# (2.2.3+), or downloaded once by the app itself (browser_setup.py) from a
+# GitHub Release asset. The app always launches it through Playwright's
+# explicit `executable_path=`, which is what makes this work: an earlier
+# external-browser attempt failed because Playwright resolved the browser
+# path through an environment variable inside the exe's temp folder.
 #
-# That approach was reverted after repeated real-world failures: every
-# variant kept resolving to
-#     ...\AppData\Local\Temp\_MEIxxxxxx\playwright\driver\package\
-#     .local-browsers\chromium-1208\chrome-win64\chrome.exe
-# — Playwright's OWN frozen-app code (playwright/_impl/_transport.py)
-# does `if getattr(sys, "frozen", False): env.setdefault(
-# "PLAYWRIGHT_BROWSERS_PATH", "0")`, which is a "hermetic install"
-# relative to wherever the driver package lands — i.e. inside
-# sys._MEIPASS, this onefile build's ephemeral per-launch temp dir.
-# Overriding that env var explicitly should work (setdefault only fills
-# in a missing value) and did work in isolated testing, but confirming
-# it was genuinely live in a rebuilt, redeployed exe on the real target
-# machine turned into its own persistent problem. The official Playwright
-# docs (https://playwright.dev/python/docs/library#pyinstaller) only
-# document ONE supported pattern for PyInstaller anyway: bundle the
-# browser in. So: this now does that, matching Playwright's own default
-# frozen-mode behavior instead of fighting it — no env var to lose,
-# override, or fail to redeploy, ever again.
+# So this spec still bundles the Playwright DRIVER (node.exe + package, incl.
+# browsers.json, which says which Chromium revision is needed) but skips
+# `.local-browsers/` entirely. That folder also held chromium_headless_shell
+# (259 MB), ffmpeg and winldd, none of which this app uses (it launches
+# headed Chromium only).
 #
-# REQUIRED BUILD STEP — do this once (or whenever the playwright pip
-# version changes) on THIS BUILD MACHINE, in the same environment you
-# run `pyinstaller` from, BEFORE building:
-#
-#     set PLAYWRIGHT_BROWSERS_PATH=0
-#     playwright install chromium
-#
-# That downloads Chromium into this environment's own
-# site-packages\playwright\driver\package\.local-browsers\ — which is
-# exactly the folder _driver_datas_including_browsers() below bundles.
-# Skip this and the build now FAILS LOUDLY (see that function) rather
-# than silently shipping an exe with an empty .local-browsers folder,
-# which would just be this same bug wearing a new disguise.
-#
-# Trade-off, worth remembering: the exe is now ~250-300MB bigger, and
-# every future auto-update re-downloads that full size rather than a
-# small delta. Reliability wins here given how much trouble the
-# external-cache alternative caused in practice.
+# Before building a RELEASE, run `python tools/prepare_release_assets.py`
+# (once per Chromium revision / Playwright upgrade): it builds the zip the
+# app downloads as a fallback, and writes installer_paths.iss for the
+# installer. Build with:
+#     pyinstaller Zoom_Ai_latest.spec --noconfirm
 
 import os
 import sys
@@ -64,25 +41,15 @@ from pathlib import Path
 
 block_cipher = None
 
-def _driver_datas_including_browsers():
-    """Bundles the ENTIRE playwright driver folder, including
-    .local-browsers/ — the actual Chromium binaries this time. See the
-    REQUIRED BUILD STEP in this file's header comment; this function
-    enforces it at build time instead of failing silently."""
+def _driver_datas():
+    """The Playwright driver (node.exe + package), WITHOUT .local-browsers/ —
+    see the header comment."""
     driver_dir = Path(playwright.__file__).parent / "driver"
-    local_browsers = driver_dir / "package" / ".local-browsers"
-    if not local_browsers.is_dir() or not any(local_browsers.iterdir()):
-        sys.exit(
-            "\n\nBUILD ABORTED: Chromium isn't installed in THIS environment's "
-            f"Playwright package ({local_browsers} is missing or empty).\n"
-            "Run this once, in the same environment you're building with, "
-            "then re-run this build:\n\n"
-            "    set PLAYWRIGHT_BROWSERS_PATH=0\n"
-            "    playwright install chromium\n"
-        )
     datas = []
     for f in driver_dir.rglob("*"):
         if not f.is_file():
+            continue
+        if ".local-browsers" in f.relative_to(driver_dir).parts:
             continue
         rel_dir = f.parent.relative_to(driver_dir)
         dest = os.path.join("playwright", "driver", str(rel_dir))
@@ -93,7 +60,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=_driver_datas_including_browsers() + [
+    datas=_driver_datas() + [
         ('assets/icon.ico', 'assets'),
     ],
     hiddenimports=[
@@ -118,6 +85,17 @@ a = Analysis(
     noarchive=False,
 )
 
+# Playwright ships its own PyInstaller hook (playwright/_impl/__pyinstaller)
+# that collects EVERYTHING under the playwright package as data — including
+# driver/package/.local-browsers (Chromium, the headless shell, ffmpeg: ~280 MB
+# compressed). Filtering only our own datas above isn't enough, so drop those
+# entries from the final list. See the header comment.
+# (The big .exe/.dll files land in a.binaries rather than a.datas — PyInstaller
+# reclassifies executables by type — so both lists need filtering. Filtering
+# only a.datas removed just the small files and left ~230 MB of Chromium in.)
+a.datas = [d for d in a.datas if ".local-browsers" not in d[0].replace("\\", "/")]
+a.binaries = [b for b in a.binaries if ".local-browsers" not in b[0].replace("\\", "/")]
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 # ── Native splash screen ─────────────────────────────────────────────
@@ -125,8 +103,7 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 # splash. That one only helps with the QApplication + MainWindow
 # construction phase — it can't appear any earlier than that, because
 # Python and PySide6 have to already be fully loaded to run it. The
-# actual dominant wait (onefile extracting the whole ~300MB bundle,
-# Chromium included) happens BEFORE that, in the bootloader itself,
+# actual dominant wait (onefile extracting the whole bundle) happens BEFORE that, in the bootloader itself,
 # before Python starts at all.
 #
 # PyInstaller's own Splash object runs at that earlier stage: the
