@@ -122,7 +122,7 @@ async def _finish_startup(startup, window, active):
     """Start the browser engine and the Prism token fetch, advance the bar as they
     complete, then replace the start-up window with the real one."""
     from prism_token import refresh_token
-    from updater import check_for_update
+    from updater import check_for_update, on_startup_complete
 
     loop = asyncio.get_running_loop()
     engine_task = loop.create_task(window.engine.start())
@@ -155,6 +155,7 @@ async def _finish_startup(startup, window, active):
         window.activateWindow()
     active.window = window
     startup.close_for_real()
+    on_startup_complete(window)     # reports a healthy start to the update script, cleans leftovers
     check_for_update(window)
     threading.Thread(target=_warm_up_pandas, name="pandas-warmup", daemon=True).start()
 
