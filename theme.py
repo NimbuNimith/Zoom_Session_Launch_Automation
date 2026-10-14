@@ -275,7 +275,7 @@ QLabel#Pill {{
     font-weight: 700;
     letter-spacing: 1px;
 }}
-QLabel#ScanLabel, QLabel#ClockLabel {{
+QLabel#ScanLabel, QLabel#ClockLabel, QLabel#VersionLabel {{
     color: {MUTED};
     font-family: {FONT_MONO};
     font-size: 11px;
@@ -295,13 +295,17 @@ QPushButton#AutoPilotBtn:hover {{ background: {AUTOPILOT_HOVER}; }}
 QPushButton#AutoPilotBtn[running="false"] {{ background: {GREEN}; }}
 QPushButton#AutoPilotBtn[running="false"]:hover {{ background: {AUTOPILOT_OFF_HOVER}; }}
 
-QPushButton#ThemeToggleBtn {{
+QPushButton#ThemeToggleBtn, QPushButton#BellBtn {{
     background: transparent;
     border: 1px solid {LINE_STRONG};
     border-radius: 15px;
     padding: 5px;
 }}
-QPushButton#ThemeToggleBtn:hover {{ background: {SURFACE_RAISED}; border-color: {MUTED}; }}
+QPushButton#ThemeToggleBtn:hover, QPushButton#BellBtn:hover {{ background: {SURFACE_RAISED}; border-color: {MUTED}; }}
+
+/* ── Warning bar (e.g. Prism token couldn't be loaded) ────────────────── */
+#WarnBar {{ background: {SURFACE_RAISED}; border-bottom: 1px solid {AMBER}; }}
+QLabel#WarnText {{ color: {AMBER}; font-size: 12px; font-weight: 600; }}
 
 /* ── Toolbar ────────────────────────────────────────────────────────── */
 #ToolBar {{ border-bottom: 1px solid {LINE}; }}

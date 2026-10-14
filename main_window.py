@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QFrame, QDialogButtonBox, QGraphicsOpacityEffect,
     QApplication, QComboBox, QDateEdit, QProgressBar, QStackedLayout,
 )
+from PySide6.QtGui import QKeySequence, QShortcut
 
 import theme
 from models import SessionModel, SessionTableModel, COL_INDEX
@@ -48,6 +49,8 @@ from datetime import date
 
 VALID_PRISM_TYPES = ("session", "workshop-session", "session-group-session")
 MAX_LOG_LINES = 500
+HEADER_STATE_KEY = "table/header_state_v1"   # column widths / order, restored at start (see _build_ui)
+HEADER_COLS_KEY = "table/header_columns"     # column count it was saved with; a different count = ignore the saved state
 PRISM_PENDING_PREFIX = "prism-pending:"
 
 def _import_pandas():
@@ -762,6 +765,13 @@ class MainWindow(QMainWindow):
         self.table_model.rowsInserted.connect(lambda *a: self._refresh_counts())
         self.table_model.modelReset.connect(self._refresh_counts)
 
+        from notifications import Notifier
+        self.notifier = Notifier(self, get_settings(), _app_icon())
+        self._update_bell_button()
+        for sig in (self.table_model.dataChanged, self.table_model.rowsInserted, self.table_model.modelReset):
+            sig.connect(lambda *a: self.notifier.on_model_changed(self.table_model.all_models()))
+        self._build_shortcuts()
+
         self._clock_timer = QTimer(self)
         self._clock_timer.timeout.connect(self._tick_clock)
         self._clock_timer.start(1000)
@@ -832,6 +842,8 @@ class MainWindow(QMainWindow):
 
     def _save_window_geometry(self):
         get_settings().setValue("window/geometry", self.saveGeometry())
+        get_settings().setValue(HEADER_STATE_KEY, self.table.horizontalHeader().saveState())
+        get_settings().setValue(HEADER_COLS_KEY, self.table_model.columnCount())
 
     # ── Shutdown ─────────────────────────────────────────────────────
     def closeEvent(self, event):
@@ -856,6 +868,7 @@ class MainWindow(QMainWindow):
 
         event.accept()  # window disappears immediately — cleanup below doesn't block that
         self._auto_pilot_timer.stop()
+        self.notifier.hide_tray()
         # Ordering matters here, and it's the actual root cause of the
         # taskbar-zombie-process bug: this safety-net thread must be
         # STARTED FIRST, before any async shutdown work begins.
@@ -919,6 +932,7 @@ class MainWindow(QMainWindow):
         root.setSpacing(0)
 
         root.addWidget(self._build_header())
+        root.addWidget(self._build_warn_bar())
         root.addWidget(self._build_toolbar())
 
         self.table = QTableView()
@@ -952,6 +966,12 @@ class MainWindow(QMainWindow):
                             ("prism_type", 150), ("prism_sync", 160),
                             ("session_id", 160), ("meeting_code", 110)]:
             self.table.setColumnWidth(COL_INDEX[key], width)
+        # Widths the user dragged to last time - only when the number of columns is the same as
+        # when they were saved, so a release that adds a column falls back to the defaults above.
+        saved_header = get_settings().value(HEADER_STATE_KEY)
+        saved_cols = get_settings().value(HEADER_COLS_KEY)
+        if saved_header is not None and str(saved_cols) == str(self.table_model.columnCount()):
+            self.table.horizontalHeader().restoreState(saved_header)
 
         # Empty state: an un-styled blank void under the headers gives a
         # first-time (or post-Clear-All) user zero indication of what to
@@ -1010,6 +1030,25 @@ class MainWindow(QMainWindow):
         self.clock_label.setObjectName("ClockLabel")
         lay.addWidget(self.clock_label)
 
+        from updater import CURRENT_VERSION
+        self.version_label = QLabel(f"v{CURRENT_VERSION}")
+        self.version_label.setObjectName("VersionLabel")
+        lay.addWidget(self.version_label)
+
+        self.btn_update = QPushButton("Check for updates")
+        self.btn_update.setObjectName("ToolBtn")
+        self.btn_update.setCursor(Qt.PointingHandCursor)
+        self.btn_update.setToolTip("Check for a new version  (Ctrl+U)")
+        self.btn_update.clicked.connect(self._on_check_updates)
+        lay.addWidget(self.btn_update)
+
+        self.btn_bell = QPushButton()
+        self.btn_bell.setObjectName("BellBtn")
+        self.btn_bell.setCursor(Qt.PointingHandCursor)
+        self.btn_bell.setFixedSize(30, 30)
+        self.btn_bell.clicked.connect(self._on_toggle_notifications)
+        lay.addWidget(self.btn_bell)
+
         self.btn_theme = QPushButton()
         self.btn_theme.setObjectName("ThemeToggleBtn")
         self.btn_theme.setCursor(Qt.PointingHandCursor)
@@ -1027,6 +1066,87 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.btn_auto)
 
         return bar
+
+    # ── Warning bar (Prism token) ────────────────────────────────────
+    def _build_warn_bar(self):
+        bar = QFrame()
+        bar.setObjectName("WarnBar")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(18, 6, 18, 6)
+        lay.setSpacing(10)
+        self.warn_text = QLabel("")
+        self.warn_text.setObjectName("WarnText")
+        self.warn_text.setWordWrap(True)
+        lay.addWidget(self.warn_text, 1)
+        self.warn_retry = QPushButton("Retry")
+        self.warn_retry.setObjectName("ToolBtn")
+        self.warn_retry.setCursor(Qt.PointingHandCursor)
+        self.warn_retry.clicked.connect(self._on_token_retry)
+        lay.addWidget(self.warn_retry)
+        close = QPushButton("\u00d7")
+        close.setObjectName("ToolBtn")
+        close.setCursor(Qt.PointingHandCursor)
+        close.setToolTip("Dismiss")
+        close.clicked.connect(bar.hide)
+        lay.addWidget(close)
+        bar.hide()
+        self.warn_bar = bar
+        return bar
+
+    def _set_token_warning(self, failed: bool):
+        if not failed:
+            self.warn_bar.hide()
+            return
+        from prism_token import token_source
+        if token_source() == "none":
+            text = ("Couldn't load the Prism token and there is no built-in one - Prism sessions, polls "
+                    "and status updates will fail until it loads.")
+        else:
+            text = ("Couldn't load the Prism token from the Google Sheet - using the built-in one, "
+                    "which may be out of date. Prism calls may be rejected.")
+        self.warn_text.setText(text)
+        self.warn_retry.setEnabled(True)
+        self.warn_bar.show()
+
+    async def refresh_prism_token(self) -> bool:
+        """Load the Prism token (retries are inside refresh_token) and show/hide the warning bar."""
+        from prism_token import refresh_token
+        ok = await refresh_token(log_fn=self.log_event)
+        self._set_token_warning(not ok)
+        return ok
+
+    def _on_token_retry(self):
+        self.warn_retry.setEnabled(False)
+        self.log_event("Retrying the Prism token...", "info")
+        asyncio.ensure_future(self.refresh_prism_token())
+
+    # ── Updates / notifications / shortcuts ──────────────────────────
+    def _on_check_updates(self):
+        from updater import check_for_update
+        check_for_update(self, manual=True)
+
+    def _update_bell_button(self):
+        on = self.notifier.enabled
+        self.btn_bell.setText("\U0001F514" if on else "\U0001F515")
+        self.btn_bell.setToolTip("Desktop notifications are ON - click to turn off" if on
+                                 else "Desktop notifications are OFF - click to turn on")
+
+    def _on_toggle_notifications(self):
+        self.notifier.set_enabled(not self.notifier.enabled)
+        self._update_bell_button()
+        self.log_event("Desktop notifications " + ("on." if self.notifier.enabled else "off."), "info")
+
+    def _build_shortcuts(self):
+        """Ctrl+O upload CSV, Ctrl+N add session, F5 refresh participants, Ctrl+L open logs,
+        Ctrl+T toggle theme, Ctrl+U check for updates. Deliberately none for Clear All or
+        Auto-Pilot - a stray keypress must never end sessions or start launching."""
+        self._shortcuts = []
+        for keys, slot in (("Ctrl+O", self._on_upload_csv), ("Ctrl+N", self._on_add_session),
+                           ("F5", self._on_refresh_participants), ("Ctrl+L", self._on_open_logs_folder),
+                           ("Ctrl+T", self._on_toggle_theme), ("Ctrl+U", self._on_check_updates)):
+            sc = QShortcut(QKeySequence(keys), self)
+            sc.activated.connect(slot)
+            self._shortcuts.append(sc)
 
     def _build_toolbar(self):
         bar = QFrame()
@@ -1052,12 +1172,12 @@ class MainWindow(QMainWindow):
             self._icon_buttons.append((b, icon_name, lambda: theme.INK, 18))
             return b
 
-        tool_btn("upload", "Upload CSV", self._on_upload_csv, tooltip="Upload Sessions CSV")
-        tool_btn("add", "Add Session", self._on_add_session)
+        tool_btn("upload", "Upload CSV", self._on_upload_csv, tooltip="Upload Sessions CSV  (Ctrl+O)")
+        tool_btn("add", "Add Session", self._on_add_session, tooltip="Add Session  (Ctrl+N)")
         self.btn_gsheets = tool_btn("refresh", "Google Sheets", self._on_sync_gsheets,
                                      tooltip="Sync from Google Sheets")
         self.btn_refresh = tool_btn("refresh", "Refresh", self._on_refresh_participants,
-                                     tooltip="Refresh Participants")
+                                     tooltip="Refresh Participants  (F5)")
         self.btn_scraping_toggle = tool_btn(
             "clock", "Pause Scraping", self._on_toggle_participant_scraping,
             tooltip="Pause Live Scraping")

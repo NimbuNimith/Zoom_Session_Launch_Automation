@@ -121,12 +121,11 @@ def _pump(app, seconds=0.0, until=None):
 async def _finish_startup(startup, window, active):
     """Start the browser engine and the Prism token fetch, advance the bar as they
     complete, then replace the start-up window with the real one."""
-    from prism_token import refresh_token
     from updater import check_for_update, on_startup_complete
 
     loop = asyncio.get_running_loop()
     engine_task = loop.create_task(window.engine.start())
-    token_task = loop.create_task(refresh_token(log_fn=window.log_event))
+    token_task = loop.create_task(window.refresh_prism_token())
 
     startup.step("Starting the browser engine…", 65, 90)
     deadline = time.monotonic() + BROWSER_WAIT_SECONDS
@@ -200,13 +199,18 @@ def main():
     _pump(app, until=lambda: not preloader.is_alive())
     from main_window import MainWindow
     from hard_exit import hard_exit
+    import error_reporting
+    from error_reporting import install_loop_handler
 
     startup.step("Building the window…", 45, 65)
     _pump(app)
     window = MainWindow()
+    error_reporting.install(window)
 
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
+
+    install_loop_handler(loop)
 
     with loop:
         loop.create_task(_finish_startup(startup, window, active))
