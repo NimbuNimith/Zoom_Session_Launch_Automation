@@ -257,6 +257,7 @@ class Engine:
         self._page_locks: dict[str, asyncio.Lock] = {}       # url -> lock, see _page_lock_for()
         self.browser_ready = False
         self.browser_provider = None   # async (revision) -> chrome.exe path; set by MainWindow
+        self.downloading_browser = False   # True during the one-time browser download (start-up window steps aside)
         self._playwright = None
         self._browser = None
         self._tasks: list[asyncio.Task] = []
@@ -304,7 +305,11 @@ class Engine:
                                            "download it. Reinstall using the latest installer.")
                     self.log("The browser isn't on this computer yet — downloading it once "
                              "(about 170 MB)...", "info")
-                    browser_exe = await self.browser_provider(rev)
+                    self.downloading_browser = True
+                    try:
+                        browser_exe = await self.browser_provider(rev)
+                    finally:
+                        self.downloading_browser = False
                 await asyncio.to_thread(remove_other_revisions, rev)   # old revisions left by earlier versions
                 self.log(f"Browser runs from a fixed location (Windows Firewall will only "
                          f"ask once): {browser_exe}", "info")

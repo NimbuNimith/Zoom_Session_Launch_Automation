@@ -25,8 +25,6 @@ import threading
 from datetime import datetime, timedelta
 import time as _time
 
-import pandas as pd
-
 from PySide6.QtCore import Qt, QTimer, QModelIndex, QUrl, QDate, QMetaObject, Q_ARG, Slot, Signal, QObject, QAbstractTableModel, QThread
 from PySide6.QtGui import QFont, QColor, QIcon, QDesktopServices
 from PySide6.QtWidgets import (
@@ -51,6 +49,11 @@ from datetime import date
 VALID_PRISM_TYPES = ("session", "workshop-session", "session-group-session")
 MAX_LOG_LINES = 500
 PRISM_PENDING_PREFIX = "prism-pending:"
+
+def _import_pandas():
+    import pandas
+    return pandas
+
 
 # Worker class for thread-safe communication with signals
 class ModeratorWorker(QObject):
@@ -1158,6 +1161,11 @@ class MainWindow(QMainWindow):
 
     async def _load_csv_async(self, path: str):
         try:
+            # pandas is imported here, not at the top of the file: importing it takes
+            # several seconds on a machine that scans every file (antivirus), and the
+            # app warms it up in the background after start-up (see app.py), so by the
+            # time anyone uploads a CSV this is normally an instant cache hit.
+            pd = await asyncio.to_thread(_import_pandas)
             df = None
             for enc in ("utf-8", "cp1252", "latin-1"):
                 try:
