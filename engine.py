@@ -1117,10 +1117,18 @@ class Engine:
         for attempt in range(1, POLL_LAUNCH_MAX_ATTEMPTS + 1):
             try:
                 async with self._page_lock_for(url):
-                    await _do_launch_poll_once(m.page, poll_name, is_prism=m.is_prism())
+                    kind = await _do_launch_poll_once(
+                        m.page, poll_name, is_prism=m.is_prism(),
+                        on_quiz=lambda: self.log(
+                            f"{prefix}'{poll_name}' is a Quiz in '{m.session_name}' (there is no Poll with "
+                            f"that name) - launching it as a Quiz.", "warn"))
                 m.poll_launching = False
-                self.model.set_fields(url, poll_status=f"{prefix}Poll Live", poll_action="Launch Poll")
-                self.log(f"{prefix}Poll '{poll_name}' launched successfully for '{m.session_name}'.", "ok")
+                if kind == "quiz":
+                    self.model.set_fields(url, poll_status=f"{prefix}Quiz Live", poll_action="Launch Poll")
+                    self.log(f"{prefix}Quiz '{poll_name}' launched for '{m.session_name}' (as a Quiz, not a Poll).", "ok")
+                else:
+                    self.model.set_fields(url, poll_status=f"{prefix}Poll Live", poll_action="Launch Poll")
+                    self.log(f"{prefix}Poll '{poll_name}' launched successfully for '{m.session_name}'.", "ok")
                 return True
             except Exception as e:
                 last_err = e
@@ -2025,6 +2033,28 @@ async def _find_poll_row(page, poll_name: str, is_prism: bool = False):
     return polls[0]
 
 
+async def _find_quiz_row(page, name: str):
+    """Locator for the title of the ONE Quiz-type entry named `name` (exact, case-insensitive),
+    or None when there is no such Quiz or several (ambiguous - the caller refuses then).
+    Only used as a fallback when the meeting has no Poll with that name (see
+    _do_launch_poll_once); a same-named Poll always wins."""
+    pattern = re.compile(rf"^\s*{re.escape(name)}\s*$", re.IGNORECASE)
+    try:
+        candidates = page.get_by_text(pattern)
+        n = await candidates.count()
+    except Exception:
+        return None
+    quizzes = []
+    for i in range(n):
+        cand = candidates.nth(i)
+        try:
+            if await _is_quiz_entry(cand):
+                quizzes.append(cand)
+        except Exception:
+            continue
+    return quizzes[0] if len(quizzes) == 1 else None
+
+
 async def _click_launch_on_row(page, title_loc) -> bool:
     """Hover the poll's title (which cascades :hover to its row) then
     click THAT row's own Launch button — and only that row's button.
@@ -2081,15 +2111,26 @@ async def _click_launch_on_row(page, title_loc) -> bool:
     raise RuntimeError("Launch button not found within this poll's own row")
 
 
-async def _do_launch_poll_once(page, poll_name: str, is_prism: bool = False):
+async def _do_launch_poll_once(page, poll_name: str, is_prism: bool = False, on_quiz=None) -> str:
     """Single attempt: Participants → More → Polls → <poll_name> →
     Launch. Raises on failure so the caller (Engine._launch_poll_task)
-    can retry / mark as Failed."""
+    can retry / mark as Failed. Returns "poll", or "quiz" when the meeting had no Poll
+    with that name but exactly one Quiz did and that was launched instead (on_quiz() is
+    called just before it is, so the caller can log the warning)."""
     await _open_polls_panel(page)   # raises a specific RuntimeError on failure
 
     row = await _find_poll_row(page, poll_name, is_prism=is_prism)
+    kind = "poll"
     if row is None:
         polls, quizzes = await _poll_and_quiz_titles(page)
+        same_name_quizzes = [q for q in quizzes if q.casefold() == poll_name.casefold()]
+        if len(same_name_quizzes) == 1:
+            row = await _find_quiz_row(page, poll_name)
+            if row is not None:
+                kind = "quiz"
+                if on_quiz:
+                    on_quiz()
+    if row is None:
         listing = (f"Polls in this meeting: {polls if polls else 'none'}"
                    + (f"; Quizzes: {quizzes}" if quizzes else ""))
         if poll_name.casefold() in {q.casefold() for q in quizzes}:
@@ -2111,16 +2152,22 @@ async def _do_launch_poll_once(page, poll_name: str, is_prism: bool = False):
     # Closed"). This used to be a blind 2 s sleep, so a lost click was
     # reported as success.
     if await _wait_poll_started(page, 9.0):
-        return
+        return kind
     # Nothing started. If the list is still on screen the click was lost —
     # click Launch once more; if not, the panel is in some other state.
-    row2 = await _find_poll_row(page, poll_name, is_prism=is_prism)
-    if row2 is not None:
+    row2 = (await _find_poll_row(page, poll_name, is_prism=is_prism) if kind == "poll"
+            else await _find_quiz_row(page, poll_name))
+    try:
+        still_listed = row2 is not None and await row2.is_visible()
+    except Exception:
+        still_listed = False
+    if still_listed:
         await _click_launch_on_row(page, row2)
         if await _wait_poll_started(page, 9.0):
-            return
-    raise RuntimeError(f"Clicked Launch for '{poll_name}' but the poll never started "
-                       f"(no 'Polling in progress' / 'End Poll' appeared) — " + await _polls_debug(page))
+            return kind
+    what = "poll" if kind == "poll" else "quiz"
+    raise RuntimeError(f"Clicked Launch for '{poll_name}' but the {what} never started "
+                       f"(no 'Polling in progress' / 'End {what.title()}' appeared) — " + await _polls_debug(page))
 
 
 async def _poll_and_quiz_titles(page):
@@ -2137,7 +2184,10 @@ async def _poll_and_quiz_titles(page):
 
 
 async def _poll_started(page) -> bool:
-    for sel in ("button:has-text('End Poll')", "text=/Polling in progress/i"):
+    # The Quiz wording below is a best guess (Zoom's Poll view was observed live; a running
+    # Quiz has not been) - see the 2.6.0 notes. A wrong guess fails safe: "never started".
+    for sel in ("button:has-text('End Poll')", "text=/Polling in progress/i",
+                "button:has-text('End Quiz')", "text=/Quiz(zing)? in progress/i"):
         try:
             if await page.locator(sel).filter(visible=True).count() > 0:
                 return True
