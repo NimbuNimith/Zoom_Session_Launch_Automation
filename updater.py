@@ -46,6 +46,9 @@ CURRENT_VERSION = "2.6.0"
 # CC_UPDATE_URL points a test build at a local update.json (never set on a learner's machine).
 UPDATE_URL = os.environ.get("CC_UPDATE_URL") or "https://raw.githubusercontent.com/NimbuNimith/Zoom_Session_Launch_Automation/main/update.json"
 
+# https only - except loopback, so a test build can be updated from a local server (CC_UPDATE_URL).
+_ALLOWED_URL_PREFIXES = ("https://", "http://127.0.0.1", "http://localhost")
+
 PACK_SPACE_FACTOR = 3.0   # the zip, plus the unpacked copy, plus room for the old folder
 
 
@@ -76,7 +79,7 @@ def parse_manifest(text: str) -> dict:
         for kind in ("exe", "pack"):
             a = m[kind]
             out[kind] = {"url": str(a["url"]), "sha256": str(a["sha256"]).lower(), "size": int(a.get("size", 0))}
-            if not out[kind]["url"].startswith("https://") or len(out[kind]["sha256"]) != 64:
+            if not out[kind]["url"].startswith(_ALLOWED_URL_PREFIXES) or len(out[kind]["sha256"]) != 64:
                 raise ValueError(f"bad {kind} entry")
         if not out["version"]:
             raise ValueError("no version")

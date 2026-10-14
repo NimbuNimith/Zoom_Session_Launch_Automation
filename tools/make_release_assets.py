@@ -73,15 +73,22 @@ def make_pack(folder: str, zip_path: str):
 
 
 def main():
+    global DIST, OUT
     ap = argparse.ArgumentParser()
     ap.add_argument("--notes", default="", help="release notes shown in the update prompt")
+    # The next three are for testing the updater with hand-made folders; a normal release uses none.
+    ap.add_argument("--dist", default=DIST, help=argparse.SUPPRESS)
+    ap.add_argument("--out", default=OUT, help=argparse.SUPPRESS)
+    ap.add_argument("--version", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--base-url", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
+    DIST, OUT = args.dist, args.out
 
     exe = os.path.join(DIST, "Zoom_Ai_latest.exe")
     if not os.path.isfile(exe) or not os.path.isdir(os.path.join(DIST, "_internal")):
         sys.exit(f"No build found at {DIST} - run PyInstaller first.")
 
-    version = current_version()
+    version = args.version or current_version()
     rid = runtime_id(DIST)
     with open(os.path.join(DIST, "runtime.id"), "w", encoding="ascii") as f:
         f.write(rid)
@@ -97,7 +104,7 @@ def main():
         dst.write(src.read())
     make_pack(DIST, os.path.join(OUT, pack_asset))
 
-    base = f"https://github.com/{REPO}/releases/download/v{version}"
+    base = args.base_url or f"https://github.com/{REPO}/releases/download/v{version}"
     manifest = {
         "version": version,
         "runtime_id": rid,
