@@ -16,6 +16,7 @@ REM
 REM Usage:  build_release.bat "What changed, shown in the update prompt"
 
 set ISCC_PATH="C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+if not exist %ISCC_PATH% set ISCC_PATH="%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
 set ENV_DIR=%LOCALAPPDATA%\CommandCenterBuild\env
 set PY="%ENV_DIR%\Scripts\python.exe"
 set NOTES=%~1

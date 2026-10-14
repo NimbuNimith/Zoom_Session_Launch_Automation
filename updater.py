@@ -43,7 +43,8 @@ from update_swap import (write_swap_script, launch_swap_script,
                          MARKER_OK, MARKER_FAILED, STAGE_DIR)
 
 CURRENT_VERSION = "2.6.0"
-UPDATE_URL = "https://raw.githubusercontent.com/NimbuNimith/Zoom_Session_Launch_Automation/main/update.json"
+# CC_UPDATE_URL points a test build at a local update.json (never set on a learner's machine).
+UPDATE_URL = os.environ.get("CC_UPDATE_URL") or "https://raw.githubusercontent.com/NimbuNimith/Zoom_Session_Launch_Automation/main/update.json"
 
 PACK_SPACE_FACTOR = 3.0   # the zip, plus the unpacked copy, plus room for the old folder
 
