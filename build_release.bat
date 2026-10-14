@@ -10,6 +10,7 @@ REM Zoom_Ai_latest.spec, installer.iss and updater.py for the full story.
 REM
 REM Prerequisites (one-time, per build machine):
 REM   tools\make_build_env.bat      (clean Python env with only what the app needs)
+REM   (PyInstaller works outside OneDrive: its temp folder is locked by sync under the project path)
 REM   Inno Setup installed: https://jrsoftware.org/isdl.php
 REM   (installs ISCC.exe — add its folder to PATH, or edit ISCC_PATH below)
 REM
@@ -46,7 +47,7 @@ if errorlevel 1 (
 
 echo.
 echo === Step 3: PyInstaller (folder build) ===
-"%ENV_DIR%\Scripts\pyinstaller.exe" Zoom_Ai_latest.spec --noconfirm --clean
+"%ENV_DIR%\Scripts\pyinstaller.exe" Zoom_Ai_latest.spec --noconfirm --clean --workpath "%LOCALAPPDATA%\CommandCenterBuild\work"
 if errorlevel 1 (
     echo PyInstaller build failed — stopping before the installer step.
     exit /b 1

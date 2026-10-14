@@ -44,6 +44,17 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def _zip_content_digest(path: str) -> str:
+    """Digest of a zip's members (name, size, CRC) rather than its raw bytes: PyInstaller
+    rewrites base_library.zip with fresh timestamps on every build, which would otherwise
+    make every build look like a runtime change (and force the full pack every time)."""
+    h = hashlib.sha256()
+    with zipfile.ZipFile(path) as z:
+        for info in sorted(z.infolist(), key=lambda i: i.filename):
+            h.update(f"{info.filename}|{info.file_size}|{info.CRC}\n".encode("utf-8"))
+    return h.hexdigest()
+
+
 def runtime_id(folder: str) -> str:
     """Hash of every file under _internal (relative path + content). Anything that changes
     what the exe runs ON - a new Python, Qt, driver or library - changes it."""
@@ -54,7 +65,8 @@ def runtime_id(folder: str) -> str:
         for name in sorted(filenames):
             full = os.path.join(dirpath, name)
             rel = os.path.relpath(full, internal).replace("\\", "/")
-            h.update(rel.encode("utf-8") + b"\0" + sha256_file(full).encode("ascii") + b"\n")
+            digest = _zip_content_digest(full) if rel == "base_library.zip" else sha256_file(full)
+            h.update(rel.encode("utf-8") + b"\0" + digest.encode("ascii") + b"\n")
     return h.hexdigest()[:32]
 
 

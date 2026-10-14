@@ -375,11 +375,15 @@ class _VersionCheck(QObject):
         threading.Thread(target=self._fetch, daemon=True, name="update-check").start()
 
     def _fetch(self):
+        from applog import log_to_file
         try:
             resp = requests.get(UPDATE_URL, timeout=8, headers={"Cache-Control": "no-cache"})
             resp.raise_for_status()
-            self.result.emit(parse_manifest(resp.text), "")
+            manifest = parse_manifest(resp.text)
+            log_to_file(f"Update check: latest is v{manifest['version']}, running v{CURRENT_VERSION}.", "info")
+            self.result.emit(manifest, "")
         except Exception as e:
+            log_to_file(f"Update check failed: {type(e).__name__}: {str(e)[:200]}", "warn")
             self.result.emit(None, f"{type(e).__name__}")
 
     @Slot(object, str)
@@ -434,5 +438,10 @@ def check_for_update(parent, manual: bool = False):
     if _check_running:
         return
     _check_running = True
+    try:
+        from applog import log_to_file
+        log_to_file(f"Update check started ({'manual' if manual else 'automatic'}) -> {UPDATE_URL}", "info")
+    except Exception:
+        pass
     _check = _VersionCheck(parent, manual)
     _check.start()
