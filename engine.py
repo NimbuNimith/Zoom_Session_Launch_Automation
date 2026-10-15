@@ -44,6 +44,7 @@ MAX_SESSIONS_PER_ACCOUNT = 2
 # was spent on it, 5 of 6 logins failed. So: only a couple of sign-ins at a time,
 # and when the error persists, reload the sign-in page and try again.
 MAX_CONCURRENT_SIGNINS = 2
+SHARE_ACCOUNT_SIGNIN = True       # one sign-in per Zoom account, reused by its other sessions (see _AccountAuth); False = every session signs in itself
 SIGNIN_ATTEMPTS = 3
 RECAPTCHA_ERROR_TEXT = "could not connect to the recaptcha service"
 RECAPTCHA_PERSIST_SECONDS = 8            # error must stay on screen this long before it counts
@@ -226,6 +227,29 @@ async def _recaptcha_unavailable(page) -> bool:
         return False
 
 
+async def _signin_form_or_redirect(page, form_selector: str, timeout: float) -> str:
+    """After opening zoom.us/signin: "form" as soon as the email form is on the page,
+    "redirected" as soon as the page is no longer under /signin (Zoom sends an already
+    signed-in browser straight on), "neither" if neither happens within `timeout`.
+
+    This replaces a plain wait_for_selector on the form, which only ever returns when the form
+    APPEARS - for a browser that is already signed in (a reused session) it sat out its whole
+    100 s timeout before concluding it was signed in."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        try:
+            if "/signin" not in page.url.lower():
+                return "redirected"
+            if await page.locator(form_selector).count() > 0:
+                return "form"
+        except Exception:
+            pass
+        if loop.time() >= deadline:
+            return "neither"
+        await asyncio.sleep(0.3)
+
+
 async def _block_zoom_protocol(route):
     # Registered with the route pattern "zoommtg://**" (see call sites),
     # so this only ever fires for that one protocol — every normal
@@ -244,6 +268,22 @@ async def _block_zoom_protocol(route):
     try:    await route.abort()
     except Exception: pass
 
+
+
+class _AccountAuth:
+    """One Zoom host account's sign-in, shared by all of that account's sessions in this app run.
+
+    Every session used to open its own browser context and type the password again, so an
+    account hosting two sessions signed in twice - and Zoom's reCAPTCHA is what refuses
+    sign-ins when several arrive together. Now the first session of an account signs in
+    (the others wait on `lock`), the resulting cookies are kept here, IN MEMORY ONLY (never
+    written to disk), and the account's other sessions - and a Relaunch of a closed
+    window - start with those cookies, so Zoom's sign-in page simply redirects them
+    onward. If the cookies have expired, the sign-in form shows up and a normal login runs."""
+
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.state = None        # Playwright storage_state of a context that is signed in
 
 class Engine:
     def __init__(self, model: SessionTableModel, log_fn):
@@ -264,6 +304,7 @@ class Engine:
         self._browser_not_ready_warned = False
         self._shutting_down = False
         self._signin_gate = asyncio.Semaphore(MAX_CONCURRENT_SIGNINS)
+        self._account_auth: dict[str, _AccountAuth] = {}   # host email -> its shared sign-in
 
     # ── Startup ──────────────────────────────────────────────────────
     async def start(self):
@@ -543,13 +584,34 @@ class Engine:
         context = None  # tracked outside the try so a failure anywhere
                          # below (even before m.page is assigned) can
                          # still close it — see the except block
+        auth = None          # this account's shared sign-in (HOST launches only)
+        auth_held = False
+        login_done = False
+
+        def release_auth():
+            nonlocal auth_held
+            if auth_held:
+                auth_held = False
+                auth.lock.release()
+
         try:
+            context_kwargs = {}
+            if mode == "HOST" and len(email) > 3 and SHARE_ACCOUNT_SIGNIN:
+                auth = self._account_auth.setdefault(email, _AccountAuth())
+                # One session of an account signs in at a time; the next one waits here and
+                # then starts from the first one's cookies instead of signing in again.
+                await auth.lock.acquire()
+                auth_held = True
+                if auth.state:
+                    context_kwargs["storage_state"] = auth.state
+                    self.log(f"Reusing the sign-in of {email} from earlier in this run.", "info")
             context = await self._browser.new_context(
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 permissions=["microphone", "camera"],
                 ignore_https_errors=True,
                 no_viewport=True,
+                **context_kwargs,
             )
             page = await context.new_page()
             if mode == "HOST":
@@ -598,11 +660,7 @@ class Engine:
                             # already-logged-in redirect resolves almost
                             # instantly — and only matters for the slow case,
                             # which is exactly the one that was failing.
-                            try:
-                                await page.wait_for_selector(SIGNIN_FORM_SEL, state="attached", timeout=100000)
-                                email_form_present = True
-                            except Exception:
-                                email_form_present = await page.locator(SIGNIN_FORM_SEL).count() > 0
+                            email_form_present = (await _signin_form_or_redirect(page, SIGNIN_FORM_SEL, 100.0)) == "form"
 
                             if email_form_present:
                                 already_logged_in = False
@@ -761,6 +819,16 @@ class Engine:
                     # already fixed once for the other failure paths.
                     raise RuntimeError(f"Login to {email} did not succeed — aborting this launch")
 
+            if auth is not None:
+                # Signed in: keep the cookies for this account's other sessions, and let
+                # whichever of them is waiting go ahead - before the (slow) meeting page load.
+                try:
+                    auth.state = await context.storage_state()
+                except Exception:
+                    auth.state = None
+                login_done = True
+                release_auth()
+
             if mode == "HOST":
                 self.model.set_fields(url, status="🌍 Starting...", action="...")
             mid = m.zoom_meeting_id() or ""
@@ -784,6 +852,8 @@ class Engine:
                 self.model.set_fields(url, status="⏳ Connecting...", action="...")
 
         except Exception as e:
+            if auth is not None and not login_done:
+                auth.state = None      # whatever we started from didn't get us signed in
             self.log(f"Zoom launch failed: {m.session_name} — {e}", "err")
             # Without this, a context created above but never reaching
             # a clean success path is never closed by anything — it's
@@ -803,6 +873,8 @@ class Engine:
             await self.cleanup_session(url)
             if mode == "HOST":
                 self.model.set_fields(url, status="❌ Failed", action="▶ Launch")
+        finally:
+            release_auth()      # also covers cancellation; a no-op once released after sign-in
 
     # ── Launch: Prism ────────────────────────────────────────────────
     def launch_prism(self, url: str):
