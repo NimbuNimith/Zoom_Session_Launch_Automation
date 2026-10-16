@@ -43,7 +43,11 @@ MAX_SESSIONS_PER_ACCOUNT = 2
 # 2026-10-12 with 4 and 2 Zoom sessions launching together: the whole 100 s wait
 # was spent on it, 5 of 6 logins failed. So: only a couple of sign-ins at a time,
 # and when the error persists, reload the sign-in page and try again.
-MAX_CONCURRENT_SIGNINS = 2
+MAX_CONCURRENT_SIGNINS = 1
+MAX_CONCURRENT_LAUNCHES = 3       # sessions loading at the same time; the rest wait for a free slot (each headed Chrome window costs ~0.8 GB)
+SIGNIN_WAIT_SECONDS = 100         # how long to wait for the password form to go away after pressing Sign in
+SIGNIN_SLOW_EXTRA_SECONDS = 140   # a sign-in whose button is still spinning after 100 s is given up to this much longer
+LOW_MEMORY_PERCENT = 10           # warn when less than this much RAM is free as a launch starts
 SHARE_ACCOUNT_SIGNIN = True       # one sign-in per Zoom account, reused by its other sessions (see _AccountAuth); False = every session signs in itself
 SIGNIN_ATTEMPTS = 3
 RECAPTCHA_ERROR_TEXT = "could not connect to the recaptcha service"
@@ -250,6 +254,31 @@ async def _signin_form_or_redirect(page, form_selector: str, timeout: float) -> 
         await asyncio.sleep(0.3)
 
 
+_NAV_INTERRUPTED = "interrupted by another navigation"
+
+
+def _meeting_id_of(url: str):
+    m = re.search(r"/wc/(\d+)/", url or "")
+    return m.group(1) if m else None
+
+
+def _on_meeting_page(current_url: str, target_url: str) -> bool:
+    """True when `current_url` is already the web-client page of the same meeting as
+    `target_url` (Zoom redirects upgrad.zoom.us/wc/ID/start to app.zoom.us/wc/ID/start)."""
+    mid = _meeting_id_of(target_url)
+    return bool(mid) and _meeting_id_of(current_url) == mid and "zoom.us" in (current_url or "")
+
+
+async def _signin_in_flight(page) -> bool:
+    """The password page's Sign in button is still spinning ("Loading" in the page text) and
+    Zoom has not shown its reCAPTCHA error: the request is slow, not refused."""
+    try:
+        text = (await page.inner_text("body", timeout=3000)).lower()
+        return "loading" in text and RECAPTCHA_ERROR_TEXT not in text
+    except Exception:
+        return False
+
+
 async def _block_zoom_protocol(route):
     # Registered with the route pattern "zoommtg://**" (see call sites),
     # so this only ever fires for that one protocol — every normal
@@ -305,6 +334,8 @@ class Engine:
         self._shutting_down = False
         self._signin_gate = asyncio.Semaphore(MAX_CONCURRENT_SIGNINS)
         self._account_auth: dict[str, _AccountAuth] = {}   # host email -> its shared sign-in
+        self._launch_gate = asyncio.Semaphore(MAX_CONCURRENT_LAUNCHES)
+        self._last_memory_warning = 0.0
 
     # ── Startup ──────────────────────────────────────────────────────
     async def start(self):
@@ -329,7 +360,10 @@ class Engine:
             note = resolved if resolved else "<unset — expected; the app launches Chromium from its own fixed folder>"
             self.log(f"Starting browser engine — PLAYWRIGHT_BROWSERS_PATH = {note}", "info")
             self._playwright = await async_playwright().start()
-            launch_args = ["--deny-permission-prompts", "--window-size=1200,800"]
+            launch_args = ["--deny-permission-prompts", "--window-size=1200,800",
+                           # fewer background helpers per window: each of up to ~6 sessions is its own Chrome
+                           "--disable-extensions", "--disable-background-networking", "--disable-component-update",
+                           "--disable-default-apps", "--no-first-run"]
 
             # Frozen builds only: Chromium is NOT inside the exe (it was 64% of every
             # update download). It lives in a fixed folder — the installer puts it
@@ -530,16 +564,76 @@ class Engine:
             "check the Event Log above for a startup error.", "warn")
 
     async def _goto_with_retry(self, page, url: str, label: str):
-        """The meeting page sometimes takes longer than 90 s to load when many
-        sessions open at once (a Prism launch failed on exactly that). One
-        more try costs nothing when it works and saves a manual Retry."""
+        """The meeting page sometimes takes longer than 90 s to load when many sessions open at
+        once (a Prism launch failed on exactly that), so one more try is made. But Zoom
+        redirects the meeting URL (upgrad.zoom.us -> app.zoom.us), and a second goto issued while
+        that redirect is still running fails with "interrupted by another navigation" even though
+        the page is on its way to the meeting - so a page that is already on (or reaches) the
+        meeting is a success, not a failure."""
+        async def settle():
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=60000)
+            except Exception:
+                pass
+            if not _on_meeting_page(page.url, url):
+                raise RuntimeError(f"the meeting page did not load (stuck at {page.url})")
+
+        try:
+            await page.goto(url, timeout=90000, wait_until="domcontentloaded")
+            return
+        except Exception as e:
+            if _NAV_INTERRUPTED in str(e):
+                self.log(f"{label}: the meeting page was redirected while loading - waiting for it.", "info")
+                return await settle()
+            if "Timeout" not in str(e):
+                raise
+            if _on_meeting_page(page.url, url):
+                self.log(f"{label}: the meeting page is slow but already open - carrying on.", "info")
+                return
+            self.log(f"{label}: the meeting page took over 90 s to load - trying once more.", "warn")
         try:
             await page.goto(url, timeout=90000, wait_until="domcontentloaded")
         except Exception as e:
-            if "Timeout" not in str(e):
-                raise
-            self.log(f"{label}: the meeting page took over 90 s to load — trying once more.", "warn")
-            await page.goto(url, timeout=90000, wait_until="domcontentloaded")
+            if _NAV_INTERRUPTED in str(e) or ("Timeout" in str(e) and _on_meeting_page(page.url, url)):
+                return await settle()
+            raise
+
+    def _warn_if_low_memory(self):
+        """One Event Log warning (at most every 2 minutes) when the PC is nearly out of RAM:
+        that, more than anything in the app, is what makes sign-ins and meeting pages time out."""
+        try:
+            import psutil, time as _t
+            vm = psutil.virtual_memory()
+            free_pct = 100.0 * vm.available / vm.total
+            if free_pct < LOW_MEMORY_PERCENT and _t.monotonic() - self._last_memory_warning > 120:
+                self._last_memory_warning = _t.monotonic()
+                self.log(f"This PC is low on memory ({free_pct:.0f}% free). Sign-ins and meeting pages will be slow "
+                         f"or time out - close other apps (browsers, chat) or launch fewer sessions at once.", "warn")
+        except Exception:
+            pass
+
+    def _watch_popups(self, context, page, label: str):
+        """Zoom's page opens a blank popup tab while a meeting loads (seen as a second tab stuck on
+        'Loading...' / about:blank, 2026-10-16). Log what it is - once, to the Event Log - and close
+        it if it is still blank after a few seconds; anything with a real address is left alone."""
+        def on_page(popup):
+            if popup is page:
+                return
+            asyncio.ensure_future(self._handle_popup(popup, label))
+        context.on("page", on_page)
+
+    async def _handle_popup(self, popup, label: str):
+        try:
+            first = popup.url
+            await asyncio.sleep(3)
+            final = popup.url
+            blank = final in ("", "about:blank") or final.startswith("zoommtg:")
+            self.log(f"{label}: Zoom opened an extra tab (first address {first or 'blank'}, after 3 s {final or 'blank'})"
+                     f"{' - closing it' if blank else ' - leaving it open'}.", "info")
+            if blank and not popup.is_closed():
+                await popup.close()
+        except Exception:
+            pass
 
     # ── Launch: Zoom ─────────────────────────────────────────────────
     def launch_zoom(self, url: str):
@@ -587,6 +681,13 @@ class Engine:
         auth = None          # this account's shared sign-in (HOST launches only)
         auth_held = False
         login_done = False
+        gate_held = False
+
+        def release_gate():
+            nonlocal gate_held
+            if gate_held:
+                gate_held = False
+                self._launch_gate.release()
 
         def release_auth():
             nonlocal auth_held
@@ -595,6 +696,11 @@ class Engine:
                 auth.lock.release()
 
         try:
+            self._warn_if_low_memory()
+            if self._launch_gate.locked():
+                self.model.set_fields(url, status="🚀 Queued (waiting for a free slot)...")
+            await self._launch_gate.acquire()
+            gate_held = True
             context_kwargs = {}
             if mode == "HOST" and len(email) > 3 and SHARE_ACCOUNT_SIGNIN:
                 auth = self._account_auth.setdefault(email, _AccountAuth())
@@ -620,7 +726,8 @@ class Engine:
             else:
                 self.guest_pages.append(page)
 
-            await page.route("zoommtg://**", _block_zoom_protocol)
+            await context.route("zoommtg://**", _block_zoom_protocol)   # context-wide: also covers popup tabs
+            self._watch_popups(context, page, m.session_name)
 
             if mode == "HOST" and len(email) > 3:
                 self.model.set_fields(url, status="🔑 Logging in...", action="...")
@@ -728,7 +835,8 @@ class Engine:
                                 # the form instead of removing it — the presence check
                                 # covers that too.)
                                 loop_clock = asyncio.get_running_loop()
-                                wait_deadline = loop_clock.time() + 100
+                                wait_deadline = loop_clock.time() + SIGNIN_WAIT_SECONDS
+                                wait_limit = wait_deadline + SIGNIN_SLOW_EXTRA_SECONDS
                                 recaptcha_since = None
                                 form_gone = False
                                 while loop_clock.time() < wait_deadline:
@@ -741,6 +849,9 @@ class Engine:
                                             raise _RecaptchaUnavailable()
                                     else:
                                         recaptcha_since = None
+                                    if (loop_clock.time() >= wait_deadline - 1 and wait_deadline < wait_limit
+                                            and await _signin_in_flight(page)):
+                                        wait_deadline = min(wait_deadline + 10, wait_limit)   # slow, not refused
                                     await asyncio.sleep(1.0)
                                 if not form_gone:
                                     raise RuntimeError(
@@ -835,6 +946,7 @@ class Engine:
             target = (f"https://upgrad.zoom.us/wc/{mid}/start"
                       if (mode == "HOST" and email) else f"https://upgrad.zoom.us/wc/{mid}/join")
             await self._goto_with_retry(page, target, m.session_name)
+            release_gate()      # the page is loaded: the next queued launch may start
 
             try:
                 rescue = page.locator("text=Join from your browser")
@@ -875,6 +987,7 @@ class Engine:
                 self.model.set_fields(url, status="❌ Failed", action="▶ Launch")
         finally:
             release_auth()      # also covers cancellation; a no-op once released after sign-in
+            release_gate()
 
     # ── Launch: Prism ────────────────────────────────────────────────
     def launch_prism(self, url: str):
@@ -899,7 +1012,13 @@ class Engine:
         await asyncio.sleep(delay)
         bot_name = m.moderator_name or "Monitor"
         context = None  # see the matching comment in _launch_zoom_task
+        gate_held = False
         try:
+            self._warn_if_low_memory()
+            if self._launch_gate.locked():
+                self.model.set_fields(url, status="🚀 Queued (waiting for a free slot)...")
+            await self._launch_gate.acquire()
+            gate_held = True
             context = await self._browser.new_context(
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -910,7 +1029,8 @@ class Engine:
             page = await context.new_page()
             m.page = page
             self._watch_for_window_close(m, page)
-            await page.route("zoommtg://**", _block_zoom_protocol)
+            await context.route("zoommtg://**", _block_zoom_protocol)   # context-wide: also covers popup tabs
+            self._watch_popups(context, page, m.session_name)
 
             cleaned_url = clean_url(url)
             mid = m.zoom_meeting_id() or ""
@@ -918,6 +1038,9 @@ class Engine:
 
             self.model.set_fields(url, status="🟣 Opening Prism...", action="...")
             await self._goto_with_retry(page, launch_url, m.session_name)
+            if gate_held:
+                gate_held = False
+                self._launch_gate.release()      # the page is loaded: the next queued launch may start
 
             try: await page.keyboard.press("Escape")
             except Exception: pass
@@ -1057,6 +1180,10 @@ class Engine:
             m.page = None
             await self.cleanup_session(url)
             self.model.set_fields(url, status="❌ Prism Failed", action="▶ Launch")
+        finally:
+            if gate_held:       # failed or cancelled before the page loaded
+                gate_held = False
+                self._launch_gate.release()
 
     # ── End meeting ──────────────────────────────────────────────────
     def end_session(self, url: str):
