@@ -18,7 +18,8 @@ WHAT KEEPS IT QUIET AND SAFE
   * the same line is not repeated within DEDUPE_SECONDS;
   * every moderator's updates for a day go into one Chat thread (`threadKey`);
   * sanitize() cuts a line at the first " | " (that is where screenshot paths and page text start in
-    the Event Log) and drops anything that looks like a secret (zak=, pwd=, token=, key=, password);
+    the Event Log), drops anything that looks like a secret (zak=, pwd=, token=, key=, password),
+    and replaces every link and every long opaque string with <link> / <redacted>;
   * posting problems never reach the rest of the app and are reported at most once a minute.
 The class has no Qt in it (a plain background thread), so it is testable on its own.
 """
@@ -45,7 +46,9 @@ SETTINGS_KEY = "chatfeed/enabled"
 WEBHOOK_PREFIX = "https://chat.googleapis.com/"
 SELF_PREFIX = "Chat updates"      # the feed's own Event Log lines start with this and are never re-posted
 
-_SECRET = re.compile(r"(zak=|pwd=|token=|key=|password|passwd|bearer\s|authorization)", re.IGNORECASE)
+_URL = re.compile(r"https?://\S+", re.IGNORECASE)
+_LONG_TOKEN = re.compile(r"[A-Za-z0-9_\-+/=]{32,}")
+_SECRET = re.compile(r"(zak=|pwd=|token=|key=|passw(?:or)?d\s*[:=]|bearer\s|authorization)", re.IGNORECASE)
 
 _EVENT_STYLE = {
     "Session is live": ("🔴 LIVE", None),
@@ -70,8 +73,13 @@ def sanitize(line: str, max_len: int = MAX_LINE_LENGTH) -> str:
         return ""
     line = line.split(" | ", 1)[0]
     line = " ".join(line.split())
+    # A secret check on the raw text first (a URL with zak=/pwd=/token= must drop the whole line),
+    # then no link ever leaves the PC and no long opaque string (a token, an id) either: the room
+    # needs "what happened", not addresses.
     if not line or _SECRET.search(line):
         return ""
+    line = _URL.sub("<link>", line)
+    line = _LONG_TOKEN.sub("<redacted>", line)
     return line if len(line) <= max_len else line[: max_len - 1] + "…"
 
 
