@@ -2187,8 +2187,10 @@ async def _find_poll_row(page, poll_name: str, is_prism: bool = False):
     questions' (confirmed against real duplicate-poll setups) — so
     is_prism picks the candidate with that question count instead of
     refusing outright. Only applies when the count resolves to exactly
-    ONE candidate; if zero or more than one entry carries the expected
-    count, this still raises RuntimeError rather than guess further —
+    ONE candidate. If the count doesn't settle it, a final rule picks the
+    one entry whose title is written in CAPITALS ('END SESSION POLL' over
+    'End Session Poll'), again only when exactly one is. If neither rule
+    resolves it, this still raises RuntimeError rather than guess further —
     ambiguity should surface as an actionable failure in the Event Log,
     not a silent guess (a silent guess picking the wrong entry is
     exactly what caused a past mis-launch)."""
@@ -2223,11 +2225,28 @@ async def _find_poll_row(page, poll_name: str, is_prism: bool = False):
                 by_count.append(cand)
         if len(by_count) == 1:
             return by_count[0]
+        # One more rule (2026-10-21): the name matches several Polls and the question count
+        # didn't single one out - launch the one whose title is written in CAPITALS
+        # ("END SESSION POLL" over "End Session Poll"). Looked at among the candidates with
+        # the expected question count when there are several of those, else among all of them.
+        # Still ambiguous (none or more than one all-caps title) -> refuse, as before.
+        pool = by_count if len(by_count) > 1 else polls
+        capitals = []
+        for cand in pool:
+            try:
+                title = (await cand.inner_text()).strip()
+            except Exception:
+                continue
+            if any(ch.isalpha() for ch in title) and title == title.upper():
+                capitals.append(cand)
+        if len(capitals) == 1:
+            return capitals[0]
         raise RuntimeError(
             f"Poll name '{poll_name}' matches {len(polls)} Poll-type entries in this "
             f"meeting — ambiguous, refusing to guess which one to launch "
             f"(expected exactly one with {target_count} questions for "
-            f"{'a Prism' if is_prism else 'a Zoom'} session, found {len(by_count)})."
+            f"{'a Prism' if is_prism else 'a Zoom'} session, found {len(by_count)}; "
+            f"and exactly one title in capitals, found {len(capitals)})."
         )
     return polls[0]
 
