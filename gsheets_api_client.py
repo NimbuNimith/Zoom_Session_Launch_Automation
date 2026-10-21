@@ -188,6 +188,31 @@ class GSheetsAPIClient:
             raise GSheetsError('EMPTY_TOKEN', 'The script returned success but no token', resp.status_code)
         return token
 
+    def fetch_chat_webhook(self) -> str:
+        """The shared Google Chat room's webhook URL, from the Apps Script's Script Properties
+        (`action=chat_webhook`; set via the sheet menu Command Center > Set Chat webhook). It is a
+        secret, so it is fetched like the Prism token instead of living in the app.
+        Raises GSheetsError like fetch_token (an older script without the action answers
+        MISSING_PARAMS; nothing configured yet answers EMPTY_WEBHOOK)."""
+        try:
+            resp = self.session.get(self.base_url, params={'action': 'chat_webhook'}, timeout=self.timeout)
+        except requests.Timeout:
+            raise GSheetsError('TIMEOUT', f'Request timed out after {self.timeout}s', 408)
+        except requests.RequestException as e:
+            raise GSheetsError('NETWORK_ERROR', f'Network error: {e}', 0)
+        if resp.status_code != 200:
+            raise GSheetsError('HTTP_ERROR', f'Status {resp.status_code}', resp.status_code)
+        try:
+            data = resp.json()
+        except ValueError:
+            raise GSheetsError('INVALID_JSON', 'Response is not valid JSON', resp.status_code)
+        if not data.get('success'):
+            raise GSheetsError(data.get('error', 'UNKNOWN'), data.get('message', ''), resp.status_code)
+        url = str(data.get('url') or '').strip()
+        if not url:
+            raise GSheetsError('EMPTY_WEBHOOK', 'The script returned success but no webhook URL', resp.status_code)
+        return url
+
     def _normalize_session(self, raw: Dict[str, Any]) -> Dict[str, str]:
         """Ensure all CSV_FORMAT.md columns exist with string values."""
         csv_columns = [

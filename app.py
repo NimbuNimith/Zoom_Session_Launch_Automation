@@ -126,6 +126,7 @@ async def _finish_startup(startup, window, active):
     loop = asyncio.get_running_loop()
     engine_task = loop.create_task(window.engine.start())
     token_task = loop.create_task(window.refresh_prism_token())
+    loop.create_task(window.load_chat_webhook())       # the shared Google Chat room (chat_feed.py); never raises
 
     startup.step("Starting the browser engine…", 65, 90)
     deadline = time.monotonic() + BROWSER_WAIT_SECONDS

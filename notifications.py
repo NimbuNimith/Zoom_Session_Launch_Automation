@@ -43,10 +43,9 @@ def _classify_poll(poll_status: str):
     return None
 
 
-def detect_events(prev: dict, sessions) -> list:
-    """prev: {join_url: (status_kind, poll_kind)} from the last call (updated in place).
-    sessions: objects with join_url, session_name, status, poll_status.
-    Returns [(title, message)] for transitions INTO live / failed / closed / poll live / poll failed."""
+def detect_events_ex(prev: dict, sessions) -> list:
+    """Like detect_events, but each event is (title, message, session) so a listener (the Google
+    Chat feed) can say WHICH session - host account, start time - and not only its name."""
     events = []
     for m in sessions:
         sk, pk = _classify_status(m.status), _classify_poll(m.poll_status)
@@ -57,19 +56,26 @@ def detect_events(prev: dict, sessions) -> list:
         name = m.session_name or "Session"
         if sk != old[0]:
             if sk == "live":
-                events.append(("Session is live", name))
+                events.append(("Session is live", name, m))
             elif sk == "failed":
-                events.append(("Session failed", f"{name} - see the Event Log"))
+                events.append(("Session failed", f"{name} - see the Event Log", m))
             elif sk == "closed":
-                events.append(("Session window closed", f"{name} - use Relaunch to reopen it"))
+                events.append(("Session window closed", f"{name} - use Relaunch to reopen it", m))
         if pk != old[1]:
             if pk == "poll_live":
-                events.append(("Poll is live", name))
+                events.append(("Poll is live", name, m))
             elif pk == "poll_failed":
-                events.append(("Poll failed", f"{name}: {(m.poll_status or '').replace('Failed:', '').strip()}"))
+                events.append(("Poll failed", f"{name}: {(m.poll_status or '').replace('Failed:', '').strip()}", m))
     for gone in set(prev) - {m.join_url for m in sessions}:
         del prev[gone]
     return events
+
+
+def detect_events(prev: dict, sessions) -> list:
+    """prev: {join_url: (status_kind, poll_kind)} from the last call (updated in place).
+    sessions: objects with join_url, session_name, status, poll_status.
+    Returns [(title, message)] for transitions INTO live / failed / closed / poll live / poll failed."""
+    return [(t, msg) for t, msg, _ in detect_events_ex(prev, sessions)]
 
 
 class Notifier(QObject):
@@ -81,6 +87,7 @@ class Notifier(QObject):
         self._pending = []
         self.enabled = str(settings.value(SETTINGS_KEY, "true")).lower() not in ("false", "0")
         self.shown = []    # what was actually displayed (for tests)
+        self.listeners = []   # callables(events_with_sessions): see on_model_changed
         self._tray = tray
         if self._tray is None and QSystemTrayIcon.isSystemTrayAvailable():
             self._tray = QSystemTrayIcon(icon, window)
@@ -98,8 +105,16 @@ class Notifier(QObject):
 
     def on_model_changed(self, sessions):
         """Call whenever session data changed (the table model's dataChanged)."""
-        events = detect_events(self._prev, sessions)
-        if not events or not self.enabled or self._window_in_use():
+        full = detect_events_ex(self._prev, sessions)
+        if not full:
+            return
+        for cb in self.listeners:       # e.g. the Google Chat feed: always, whatever the bell / window focus
+            try:
+                cb(full)
+            except Exception:
+                pass
+        events = [(t, msg) for t, msg, _ in full]
+        if not self.enabled or self._window_in_use():
             return
         self._pending.extend(events)
         self._timer.start()

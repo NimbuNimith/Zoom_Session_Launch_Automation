@@ -738,6 +738,8 @@ class GSheetsSyncDialog(QDialog):
 # Main window
 # ─────────────────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
+    chat_problem = Signal(str)   # emitted from the Chat feed's sender thread; shown in the Event Log on the UI thread
+
     def __init__(self):
         super().__init__()
         from updater import CURRENT_VERSION
@@ -768,6 +770,15 @@ class MainWindow(QMainWindow):
         from notifications import Notifier
         self.notifier = Notifier(self, get_settings(), _app_icon())
         self._update_bell_button()
+        from chat_feed import ChatFeed
+        self.chat_problem.connect(lambda text: self.log_event(text, "warn"))
+        self.chat_feed = ChatFeed(self._chat_moderator_name, settings=get_settings(), on_error=self.chat_problem.emit)
+        self.notifier.listeners.append(self.chat_feed.on_events)      # LIVE / failed / closed / poll transitions
+        self._summary_timer = QTimer(self)                            # "5 live, 1 failed of 6" every 10 minutes
+        self._summary_timer.setInterval(10 * 60 * 1000)
+        self._summary_timer.timeout.connect(self._post_chat_summary)
+        self._summary_timer.start()
+        self._update_chat_button()
         for sig in (self.table_model.dataChanged, self.table_model.rowsInserted, self.table_model.modelReset):
             sig.connect(lambda *a: self.notifier.on_model_changed(self.table_model.all_models()))
         self._build_shortcuts()
@@ -869,6 +880,9 @@ class MainWindow(QMainWindow):
         event.accept()  # window disappears immediately — cleanup below doesn't block that
         self._auto_pilot_timer.stop()
         self.notifier.hide_tray()
+        self._summary_timer.stop()
+        self.chat_feed.post("⚪ Command Center closed")
+        self.chat_feed.stop(flush_timeout=3.0)      # best effort, bounded: never delays the exit more than 3 s
         # Ordering matters here, and it's the actual root cause of the
         # taskbar-zombie-process bug: this safety-net thread must be
         # STARTED FIRST, before any async shutdown work begins.
@@ -1042,6 +1056,13 @@ class MainWindow(QMainWindow):
         self.btn_update.clicked.connect(self._on_check_updates)
         lay.addWidget(self.btn_update)
 
+        self.btn_chat = QPushButton("\U0001F4AC")
+        self.btn_chat.setObjectName("ChatBtn")
+        self.btn_chat.setCursor(Qt.PointingHandCursor)
+        self.btn_chat.setFixedSize(30, 30)
+        self.btn_chat.clicked.connect(self._on_toggle_chat_feed)
+        lay.addWidget(self.btn_chat)
+
         self.btn_bell = QPushButton()
         self.btn_bell.setObjectName("BellBtn")
         self.btn_bell.setCursor(Qt.PointingHandCursor)
@@ -1121,6 +1142,75 @@ class MainWindow(QMainWindow):
         asyncio.ensure_future(self.refresh_prism_token())
 
     # ── Updates / notifications / shortcuts ──────────────────────────
+    # ── Shared Google Chat room (chat_feed.py) ───────────────────────
+    def _chat_moderator_name(self) -> str:
+        """Whose updates these are: the most common moderator among the loaded sessions."""
+        names = [m.moderator_name for m in self.table_model.all_models() if getattr(m, "moderator_name", "")]
+        if names:
+            return max(set(names), key=names.count)
+        return os.environ.get("USERNAME", "") or "Moderator"
+
+    async def load_chat_webhook(self):
+        """Fetch the room's webhook from the Apps Script at start-up (like the Prism token) and switch the
+        feed on. Never raises: no webhook just means the feed stays off."""
+        import asyncio as _asyncio
+        from prism_token import _is_transient, _RETRY_DELAYS
+        from gsheets_api_client import create_client_from_settings
+        url, reason = None, "not configured"
+        if not self.chat_feed.configured:       # (CC_CHAT_WEBHOOK, when set, is already in place)
+            for delay in _RETRY_DELAYS:
+                if delay:
+                    await _asyncio.sleep(delay)
+                try:
+                    url = await _asyncio.to_thread(create_client_from_settings().fetch_chat_webhook)
+                    break
+                except GSheetsError as e:
+                    reason = e.code
+                    if not _is_transient(e):
+                        break
+                except Exception as e:
+                    reason = type(e).__name__
+            if url:
+                self.chat_feed.set_webhook(url)
+        self._update_chat_button()
+        if self.chat_feed.configured:
+            self.log_event("Chat updates: " + ("switched off on this PC (click the chat button to resume)." if not self.chat_feed.enabled
+                           else "this app posts to the shared Google Chat room as " + self._chat_moderator_name() + "."), "info")
+            if self.chat_feed.active:
+                from updater import CURRENT_VERSION
+                self.chat_feed.post(f"🟢 Command Center v{CURRENT_VERSION} started — {len(self.table_model.all_models())} session(s) loaded")
+        else:
+            self.log_event(f"Chat updates: off ({reason}) - the master sheet's Chat webhook is not set yet.", "info")
+
+    def _update_chat_button(self):
+        f = self.chat_feed
+        if not f.configured:
+            self.btn_chat.setEnabled(False)
+            self.btn_chat.setToolTip("Google Chat updates: no room configured yet")
+        else:
+            self.btn_chat.setEnabled(True)
+            self.btn_chat.setText("\U0001F4AC" if f.enabled else "\U0001F6AB")
+            self.btn_chat.setToolTip("Updates from this PC are posted to the shared Google Chat room - click to pause"
+                                     if f.enabled else "Chat updates are paused on this PC - click to resume")
+
+    def _on_toggle_chat_feed(self):
+        self.chat_feed.set_enabled(not self.chat_feed.enabled)
+        self._update_chat_button()
+        self.log_event("Chat updates " + ("resumed." if self.chat_feed.enabled else "paused on this PC."), "info")
+
+    def _post_chat_summary(self):
+        """Every 10 minutes while sessions are loaded: how many are live / failed / closed."""
+        models = self.table_model.all_models()
+        if not models or not self.chat_feed.active:
+            return
+        live = sum("LIVE" in m.status for m in models)
+        failed = sum(("Failed" in m.status or "Force Closed" in m.status) for m in models)
+        closed = sum("Window Closed" in m.status for m in models)
+        if not (live or failed or closed):
+            return
+        text = f"📋 {len(models)} session(s): {live} live" + (f", {failed} failed" if failed else "") + (f", {closed} window closed" if closed else "")
+        self.chat_feed.post(text + f" ({datetime.now().strftime('%H:%M')})")
+
     def _on_check_updates(self):
         from updater import check_for_update
         check_for_update(self, manual=True)
@@ -1265,6 +1355,9 @@ class MainWindow(QMainWindow):
             f'<span style="color:{theme.INK}">{_escape(msg)}</span>'
         )
         log_to_file(msg, level)  # persisted separately — see applog.py
+        feed = getattr(self, "chat_feed", None)
+        if feed is not None:
+            feed.on_log(msg, level)      # warnings / errors go to the shared Google Chat room (chat_feed.py)
 
     def _on_open_logs_folder(self):
         os.makedirs(LOG_DIR, exist_ok=True)  # in case nothing's been logged yet this run
@@ -1672,6 +1765,7 @@ class MainWindow(QMainWindow):
                 f"Auto-Pilot ON — sessions launch within the configured window, "
                 f"poll(s) auto-launch {AUTO_POLL_END_MINUTES}m before End Time.", "ok")
             QTimer.singleShot(3000, self._start_auto_pilot_loop)
+            self.chat_feed.post(f"▶ Auto-Pilot started — {len(self.table_model.all_models())} session(s) loaded")
             self.btn_auto.style().unpolish(self.btn_auto)
             self.btn_auto.style().polish(self.btn_auto)
         else:
@@ -1686,6 +1780,7 @@ class MainWindow(QMainWindow):
         self.btn_auto.setProperty("running", "false")
         self.scan_label.setText("Auto-Pilot idle")
         self.log_event("Auto-Pilot stopped.", "warn")
+        self.chat_feed.post("■ Auto-Pilot stopped")
         self.btn_auto.style().unpolish(self.btn_auto)
         self.btn_auto.style().polish(self.btn_auto)
 
