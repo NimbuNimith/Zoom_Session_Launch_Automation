@@ -45,6 +45,7 @@ MAX_SESSIONS_PER_ACCOUNT = 2
 # and when the error persists, reload the sign-in page and try again.
 MAX_CONCURRENT_SIGNINS = 1
 BLOCK_EXTRA_TABS = True           # stop Zoom's pages opening extra tabs (see _BLOCK_POPUPS_JS)
+STRAY_TAB_GRACE_SECONDS = 2.0     # a tab opened by a page is closed after this long unless it is the Zoom web client
 MAX_CONCURRENT_LAUNCHES = 3       # sessions loading at the same time; the rest wait for a free slot (each headed Chrome window costs ~0.8 GB)
 SIGNIN_WAIT_SECONDS = 100         # how long to wait for the password form to go away after pressing Sign in
 SIGNIN_SLOW_EXTRA_SECONDS = 140   # a sign-in whose button is still spinning after 100 s is given up to this much longer
@@ -305,6 +306,22 @@ async def _signin_in_flight(page) -> bool:
         return False
 
 
+def _is_zoom_client_url(url: str) -> bool:
+    """https://<anything>.zoom.us/wc/... - the Zoom web client, the one kind of popup that may stay open."""
+    try:
+        from urllib.parse import urlsplit
+        p = urlsplit(url or "")
+        host = (p.hostname or "").lower()
+        return p.scheme == "https" and (host == "zoom.us" or host.endswith(".zoom.us")) and p.path.startswith("/wc/")
+    except Exception:
+        return False
+
+
+def _without_query(url: str) -> str:
+    """The address without ?query / #fragment: enough to say where a tab was, nothing that could be a secret."""
+    return (url or "about:blank").split("?", 1)[0].split("#", 1)[0][:120]
+
+
 async def _block_zoom_protocol(route):
     # Registered with the route pattern "zoommtg://**" (see call sites),
     # so this only ever fires for that one protocol — every normal
@@ -430,6 +447,7 @@ class Engine:
                 "err",
             )
             return
+        await self._start_tab_watcher()
         self.browser_ready = True
         self.log("✅ Browser engine ready.", "ok")
         self._tasks.append(asyncio.create_task(self._fast_live_loop()))
@@ -623,6 +641,45 @@ class Engine:
             if _NAV_INTERRUPTED in str(e) or ("Timeout" in str(e) and _on_meeting_page(page.url, url)):
                 return await settle()
             raise
+
+    # ── Extra tabs opened by pages ───────────────────────────────────
+    async def _start_tab_watcher(self):
+        """Watch the browser itself (Chrome's DevTools 'Target' events), not the pages: Playwright does not
+        report a popup tab while its first load is still hanging, which is exactly how Zoom's blank
+        tracking tab behaves, so neither the init script (blocks window.open) nor a page-level handler
+        can be relied on alone. Any tab that another tab opened (`openerId`) is closed after a couple of
+        seconds unless it is the Zoom web client; one Event Log line says what it was."""
+        self._tab_urls = {}
+        try:
+            self._cdp = await self._browser.new_browser_cdp_session()
+            self._cdp.on("Target.targetCreated", self._on_target_created)
+            self._cdp.on("Target.targetInfoChanged", self._on_target_info)
+            await self._cdp.send("Target.setDiscoverTargets", {"discover": True})
+        except Exception as e:
+            self._cdp = None
+            self.log(f"Extra-tab watcher unavailable ({type(e).__name__}); pages are still stopped from opening popups.", "info")
+
+    def _on_target_created(self, ev):
+        ti = ev.get("targetInfo", {})
+        self._tab_urls[ti.get("targetId")] = ti.get("url", "")
+        if BLOCK_EXTRA_TABS and ti.get("type") == "page" and ti.get("openerId"):
+            asyncio.ensure_future(self._close_stray_tab(ti.get("targetId"), ti.get("url", "")))
+
+    def _on_target_info(self, ev):
+        ti = ev.get("targetInfo", {})
+        if ti.get("targetId") in self._tab_urls:
+            self._tab_urls[ti["targetId"]] = ti.get("url", "")
+
+    async def _close_stray_tab(self, target_id, first_url: str):
+        try:
+            await asyncio.sleep(STRAY_TAB_GRACE_SECONDS)       # a real web-client popup shows its address by now
+            url = self._tab_urls.get(target_id) or first_url or ""
+            if _is_zoom_client_url(url):
+                return
+            await self._cdp.send("Target.closeTarget", {"targetId": target_id})
+            self.log(f"Closed an extra browser tab that a page opened (it was at {_without_query(url)}).", "info")
+        except Exception:
+            pass                                                # already gone, or the browser is closing
 
     def _warn_if_low_memory(self):
         """One Event Log warning (at most every 2 minutes) when the PC is nearly out of RAM:
