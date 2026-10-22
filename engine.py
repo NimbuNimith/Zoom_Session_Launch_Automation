@@ -44,6 +44,7 @@ MAX_SESSIONS_PER_ACCOUNT = 2
 # was spent on it, 5 of 6 logins failed. So: only a couple of sign-ins at a time,
 # and when the error persists, reload the sign-in page and try again.
 MAX_CONCURRENT_SIGNINS = 1
+BLOCK_EXTRA_TABS = True           # stop Zoom's pages opening extra tabs (see _BLOCK_POPUPS_JS)
 MAX_CONCURRENT_LAUNCHES = 3       # sessions loading at the same time; the rest wait for a free slot (each headed Chrome window costs ~0.8 GB)
 SIGNIN_WAIT_SECONDS = 100         # how long to wait for the password form to go away after pressing Sign in
 SIGNIN_SLOW_EXTRA_SECONDS = 140   # a sign-in whose button is still spinning after 100 s is given up to this much longer
@@ -255,6 +256,31 @@ async def _signin_form_or_redirect(page, form_selector: str, timeout: float) -> 
 
 
 _NAV_INTERRUPTED = "interrupted by another navigation"
+
+# Zoom's sign-in/home page opens a blank tab (window.open) that then hops through advertising and
+# analytics addresses (zoom.us -> s.company-target.com -> doubleclick.net) for ~15 s before closing
+# itself (seen 2026-10-16). It is useless to us and costs memory, and Playwright cannot even see it
+# while its first load hangs, so it can't be closed afterwards - it has to never open. This runs in
+# every frame of every page of a session's browser context before the page's own scripts:
+# window.open does nothing (and hands back a harmless stand-in, so the page's own code that sets
+# `w.location = ...` afterwards doesn't throw) UNLESS it opens the Zoom web client itself
+# (https://<anything>.zoom.us/wc/...), which a meeting join could need.
+_BLOCK_POPUPS_JS = """
+(() => {
+  const real = window.open;
+  const allowed = (u) => {
+    try { const x = new URL(u, location.href);
+          return x.protocol === 'https:' && /(^|\\.)zoom\\.us$/.test(x.hostname) && x.pathname.indexOf('/wc/') === 0; }
+    catch (e) { return false; }
+  };
+  const stub = () => ({ closed: true, location: {}, opener: null, document: { write() {}, writeln() {}, close() {} },
+                        close() {}, focus() {}, blur() {}, postMessage() {} });
+  window.open = function (url, ...rest) {
+    if (url && allowed(url)) return real.call(window, url, ...rest);
+    return stub();
+  };
+})();
+"""
 
 
 def _meeting_id_of(url: str):
@@ -727,6 +753,8 @@ class Engine:
                 self.guest_pages.append(page)
 
             await context.route("zoommtg://**", _block_zoom_protocol)   # context-wide: also covers popup tabs
+            if BLOCK_EXTRA_TABS:
+                await context.add_init_script(_BLOCK_POPUPS_JS)
             self._watch_popups(context, page, m.session_name)
 
             if mode == "HOST" and len(email) > 3:
@@ -1030,6 +1058,8 @@ class Engine:
             m.page = page
             self._watch_for_window_close(m, page)
             await context.route("zoommtg://**", _block_zoom_protocol)   # context-wide: also covers popup tabs
+            if BLOCK_EXTRA_TABS:
+                await context.add_init_script(_BLOCK_POPUPS_JS)
             self._watch_popups(context, page, m.session_name)
 
             cleaned_url = clean_url(url)
