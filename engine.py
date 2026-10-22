@@ -355,7 +355,7 @@ class _AccountAuth:
 
     def __init__(self):
         self.lock = asyncio.Lock()
-        self.state = None        # Playwright storage_state of a context that is signed in
+        self.state = None        # {"cookies": [...], "origins": []} (storage_state format) of a signed-in context
 
 class Engine:
     def __init__(self, model: SessionTableModel, log_fn):
@@ -1018,8 +1018,14 @@ class Engine:
             if auth is not None:
                 # Signed in: keep the cookies for this account's other sessions, and let
                 # whichever of them is waiting go ahead - before the (slow) meeting page load.
+                # Cookies only - NOT context.storage_state(). storage_state() also reads localStorage, and to
+                # do that Playwright opens its OWN extra tab and visits every address the page ever touched
+                # (zoom.us, then each advertising / analytics iframe: s.company-target.com, doubleclick.net...).
+                # That was the "second tab" after sign-in, and with slow third-party hosts it held this
+                # session - and every other session of the same account, which waits on this lock - for
+                # many seconds before it could go on to the meeting. Zoom's sign-in is the cookies.
                 try:
-                    auth.state = await context.storage_state()
+                    auth.state = {"cookies": await context.cookies(), "origins": []}
                 except Exception:
                     auth.state = None
                 login_done = True
