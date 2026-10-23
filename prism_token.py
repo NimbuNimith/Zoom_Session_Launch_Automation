@@ -3,10 +3,11 @@ prism_token.py
 ----------------
 Where the Prism API bearer token comes from at runtime.
 
-The token is kept in the Google Sheet (Config tab, cell B1) and fetched
-through the Apps Script integration this app already uses for the session
-roster, instead of living in the app's own code — so it can be rotated by
-editing one cell, with no rebuild or redistribution. refresh_token() runs
+The token is kept in the Apps Script's Script Properties (set from the master
+Sheet's "Command Center > Update Prism token" menu) and fetched through the
+Apps Script integration this app already uses for the session roster, instead
+of living in the app's own code — so it can be rotated with no rebuild or
+redistribution. refresh_token() runs
 once at startup (see app.py) and caches the result in memory;
 prism_data_pull / prism_status_push read it through get_cached_token().
 
@@ -37,6 +38,15 @@ _cached_token = None          # set once the Sheet has answered; None = use the 
 # cell, script not updated) won't change by waiting, so they aren't.
 _RETRY_DELAYS = (0, 5, 10)    # seconds to wait before each attempt
 _TRANSIENT_CODES = {"TIMEOUT", "NETWORK_ERROR"}
+
+
+def _is_transient(e: GSheetsError) -> bool:
+    """Timeouts and network errors, plus HTTP 404 / 5xx from script.google.com: Apps Script
+    sometimes answers a perfectly valid deployment URL with a one-off 404 or 5xx (seen on
+    2026-10-09), and the next request works."""
+    if e.code in _TRANSIENT_CODES:
+        return True
+    return e.code == "HTTP_ERROR" and (e.status_code == 404 or e.status_code >= 500)
 
 
 def get_cached_token() -> str:
@@ -71,7 +81,7 @@ async def refresh_token(log_fn=None) -> bool:
             token = await asyncio.to_thread(client.fetch_token)
         except GSheetsError as e:
             last_reason = f"{e.code}: {e.message}"
-            if e.code not in _TRANSIENT_CODES:
+            if not _is_transient(e):
                 break
         except Exception as e:
             last_reason = f"{type(e).__name__}: {e}"
@@ -86,5 +96,6 @@ async def refresh_token(log_fn=None) -> bool:
     else:
         log(f"Prism token: couldn't load it from the Google Sheet ({last_reason}) and "
             f"there's no built-in token — Prism features won't work until this is fixed "
-            f"(check the Config tab and that the Apps Script has the 'token' action).", "err")
+            f"(check that the Apps Script has the 'token' action and that the token is set via "
+            f"Command Center > Update Prism token in the master Sheet).", "err")
     return False

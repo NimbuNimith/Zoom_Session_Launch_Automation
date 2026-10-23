@@ -23,7 +23,7 @@
 ; touch (or register over) a real installation.
 
 #define MyAppName "Zoom + Prism Command Center"
-#define MyAppVersion "2.5.6"
+#define MyAppVersion "2.7.3"
 #define MyAppPublisher "upGrad Education"
 #define MyAppExeName "Zoom_Ai_latest.exe"
 
@@ -87,14 +87,10 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"
 
 [Files]
-; Zoom_Ai_latest.spec builds onefile (a.binaries/a.datas passed directly
-; into EXE(), no separate COLLECT() step) — so this is a single file,
-; dist\Zoom_Ai_latest.exe, not a dist\Zoom_Ai_latest\ folder. Confirmed
-; against an actual build log: "Copying bootloader EXE to
-; ...\dist\Zoom_Ai_latest.exe" — no subfolder in that path. An earlier
-; version of this file assumed a folder here, which would have failed
-; to compile (Inno Setup errors on a Source pattern matching zero files).
-Source: "dist\Zoom_Ai_latest.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Zoom_Ai_latest.spec builds a FOLDER (onedir): dist\Zoom_Ai_latest\ holds the small
+; exe, runtime.id and the _internal\ folder (Python, Qt, Playwright driver). The
+; whole folder is installed as it is — nothing gets unpacked at launch.
+Source: "dist\Zoom_Ai_latest\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 ; The browser, straight from this build machine's Playwright install (see the
 ; header note). Skipped when that revision is already on this computer.
 Source: "{#ChromiumSrcDir}\*"; DestDir: "{#BrowserRoot}\chromium-{#ChromiumRev}\chrome-win64"; \
@@ -111,11 +107,23 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} now"; \
     Flags: nowait postinstall skipifsilent
 
+[InstallDelete]
+; An upgrade over an older install must not keep files the new build no longer
+; has (stale libraries next to new ones are how "works on my machine" starts).
+Type: filesandordirs; Name: "{app}\_internal"
+Type: filesandordirs; Name: "{app}\_internal.old"
+Type: filesandordirs; Name: "{app}\_internal.new"
+
 [UninstallDelete]
-; Clean up updater leftovers (see updater.py's _do_update) so a
-; reinstall doesn't find a stale .bat/.new file sitting in {app}.
+; Files the in-app updater creates next to the app (updater.py / update_swap.py),
+; plus the runtime folder, which updates replace and Inno therefore can't track.
 Type: files; Name: "{app}\*_updater.bat"
 Type: files; Name: "{app}\*.new"
+Type: files; Name: "{app}\*.old"
+Type: files; Name: "{app}\startup_ok"
+Type: filesandordirs; Name: "{app}\_internal"
+Type: filesandordirs; Name: "{app}\_internal.old"
+Type: filesandordirs; Name: "{app}\_internal.new"
 ; The browser lives here (installed above, or downloaded by the app) so it
 ; runs from a fixed path (keeps Windows Firewall from prompting on every
 ; launch). ~395 MB — don't leave it behind on uninstall.

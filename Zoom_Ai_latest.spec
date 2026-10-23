@@ -1,11 +1,20 @@
 # Zoom_Ai_latest.spec
 # ---------------------
-# PyInstaller spec for the PySide6 rebuild. Entry point is app.py, not
-# Zoom_Ai_V54.py — that's the one thing that changes from your old build
-# command. Everything else about your release process (bump version ->
-# build -> GitHub Release -> update version.txt) stays the same.
+# PyInstaller spec. Entry point is app.py.
 #
-# Build with:  pyinstaller Zoom_Ai_latest.spec --noconfirm
+# FOLDER BUILD (onedir), since 2.6.0
+# -----------------------------------------------------------------------
+# The output is dist\Zoom_Ai_latest\ : a small Zoom_Ai_latest.exe plus an
+# _internal\ folder with Python, Qt and the Playwright driver. The installer
+# copies that folder to {app}; nothing is unpacked at launch any more (the old
+# single-file exe unpacked ~2,000 files / 389 MB into %TEMP% on EVERY start,
+# and antivirus scanned each one). Updates replace only the exe unless the
+# contents of _internal changed (see updater.py / tools/make_release_assets.py).
+#
+# Build with the CLEAN environment (tools\make_build_env.bat creates .buildenv
+# with only requirements.txt + PyInstaller) so nothing from other projects
+# (pyarrow, Pillow, cryptography, ...) is swept in:
+#     .buildenv\Scripts\pyinstaller Zoom_Ai_latest.spec --noconfirm --clean
 # (see the notes below before building a release)
 #
 # CHROMIUM IS NOT BUNDLED INTO THE EXE (as of 2.5.0)
@@ -78,7 +87,10 @@ a = Analysis(
     # ("multiple Qt bindings packages") since the two can't coexist in
     # one frozen app. Excluding PyQt5 here keeps this build unaffected
     # by whatever else happens to be installed alongside it.
-    excludes=['PyQt5'],
+    # Also excluded: packages this app never uses that a shared build environment
+    # tends to contain (the clean .buildenv has none of them; this is belt and braces).
+    excludes=['PyQt5', 'PyQt6', 'tkinter', '_tkinter', 'PIL', 'pyarrow', 'cryptography',
+              'matplotlib', 'scipy', 'IPython', 'jupyter', 'notebook', 'streamlit'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -96,49 +108,47 @@ a = Analysis(
 a.datas = [d for d in a.datas if ".local-browsers" not in d[0].replace("\\", "/")]
 a.binaries = [b for b in a.binaries if ".local-browsers" not in b[0].replace("\\", "/")]
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-# ── Native splash screen ─────────────────────────────────────────────
-# This is deliberately NOT the same thing as splash.py's Qt-based
-# splash. That one only helps with the QApplication + MainWindow
-# construction phase — it can't appear any earlier than that, because
-# Python and PySide6 have to already be fully loaded to run it. The
-# actual dominant wait (onefile extracting the whole bundle) happens BEFORE that, in the bootloader itself,
-# before Python starts at all.
-#
-# PyInstaller's own Splash object runs at that earlier stage: the
-# bootloader extracts a small Tcl/Tk splash runtime FIRST (fast — it's
-# not the ~300MB main bundle), shows this image immediately, and only
-# THEN proceeds to extract the rest. app.py calls pyi_splash.close()
-# once MainWindow is actually shown. See
-# https://pyinstaller.org/en/stable/spec-files.html#example-splash-file
-splash = Splash(
-    'assets/splash.png',
-    binaries=a.binaries,
-    datas=a.datas,
-    text_pos=(44, 205),
-    text_size=11,
-    text_color='#8A8F9C',
-    text_default='Starting up…',
-    always_on_top=True,
+# ── Trim Qt ───────────────────────────────────────────────────────────
+# Only widgets are used (no QtQuick / WebEngine / 3D / multimedia). Drop the
+# translation files and the software-OpenGL fallback DLL, and any Qt module or
+# plugin PyInstaller collected that the app cannot load.
+_QT_DROP = (
+    "pyside6/translations/",
+    "opengl32sw.dll",
+    "d3dcompiler_47.dll",
+    "qt6quick", "qt6qml", "qt6pdf", "qt6webengine", "qt6designer", "qt63d",
+    "qt6charts", "qt6datavisualization", "qt6multimedia", "qt6sql", "qt6test",
+    "qt6bluetooth", "qt6positioning", "qt6sensors", "qt6serialport",
+    "qt6virtualkeyboard", "qt6remoteobjects", "qt6scxml", "qt6statemachine",
+    "plugins/qmltooling/", "plugins/designer/", "plugins/sqldrivers/",
+    "plugins/multimedia/", "plugins/position/", "plugins/sensors/",
+    "plugins/generic/", "plugins/platforminputcontexts/", "plugins/platformthemes/",
 )
+
+
+def _keep(entry):
+    name = entry[0].replace("\\", "/").lower()
+    if "pyside6" not in name:
+        return True
+    return not any(token in name for token in _QT_DROP)
+
+
+a.datas = [d for d in a.datas if _keep(d)]
+a.binaries = [b for b in a.binaries if _keep(b)]
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    splash,
-    splash.binaries,
     [],
+    exclude_binaries=True,
     name='Zoom_Ai_latest',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    upx=False,            # UPX makes antivirus slower and more suspicious, and gains little here
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -146,4 +156,13 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='assets/icon.ico',
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    name='Zoom_Ai_latest',
 )
