@@ -29,3 +29,5 @@ installer_paths.iss
 dist_new/
 build_new/
 build_new.log
+
+build_version_info.txt

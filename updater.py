@@ -42,7 +42,7 @@ from downloader import download_file, friendly_error, mb, DownloadCancelled
 from update_swap import (write_swap_script, launch_swap_script,
                          MARKER_OK, MARKER_FAILED, STAGE_DIR)
 
-CURRENT_VERSION = "2.7.3"
+CURRENT_VERSION = "2.7.4"
 # CC_UPDATE_URL points a test build at a local update.json (never set on a learner's machine).
 UPDATE_URL = os.environ.get("CC_UPDATE_URL") or "https://raw.githubusercontent.com/NimbuNimith/Zoom_Session_Launch_Automation/main/update.json"
 
