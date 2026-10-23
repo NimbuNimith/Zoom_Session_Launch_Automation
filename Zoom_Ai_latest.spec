@@ -139,6 +139,36 @@ a.binaries = [b for b in a.binaries if _keep(b)]
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# ── Windows "Details" tab (right-click the exe > Properties) ───────────────────
+# The version comes from updater.py's CURRENT_VERSION, so it can never drift from the
+# real version. The generated build_version_info.txt is git-ignored.
+import os as _os, re as _re
+from PyInstaller.utils.win32.versioninfo import (
+    VSVersionInfo, FixedFileInfo, StringFileInfo, StringTable, StringStruct, VarFileInfo, VarStruct)
+
+_ver = _re.search(r'^CURRENT_VERSION\s*=\s*"([\d.]+)"',
+                  open(_os.path.join(SPECPATH, 'updater.py'), encoding='utf-8').read(), _re.M).group(1)
+_nums = tuple((int(x) for x in _ver.split('.')[:4])) + (0,) * (4 - len(_ver.split('.')[:4]))
+_info = VSVersionInfo(
+    ffi=FixedFileInfo(filevers=_nums, prodvers=_nums, mask=0x3F, flags=0x0, OS=0x40004,
+                      fileType=0x1, subtype=0x0, date=(0, 0)),
+    kids=[
+        StringFileInfo([StringTable('040904B0', [
+            StringStruct('CompanyName', 'upGrad Education'),
+            StringStruct('FileDescription', 'Zoom + Prism Command Center'),
+            StringStruct('FileVersion', _ver + '.0' if _ver.count('.') == 2 else _ver),
+            StringStruct('InternalName', 'Zoom_Ai_latest'),
+            StringStruct('LegalCopyright', '© 2026 upGrad Education. All rights reserved.'),
+            StringStruct('OriginalFilename', 'Zoom_Ai_latest.exe'),
+            StringStruct('ProductName', 'Zoom + Prism Command Center'),
+            StringStruct('ProductVersion', _ver),
+            StringStruct('Comments', 'Launches and monitors Zoom and Prism sessions.'),
+        ])]),
+        VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
+    ])
+_version_file = _os.path.join(SPECPATH, 'build_version_info.txt')
+open(_version_file, 'w', encoding='utf-8').write(str(_info))
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -156,6 +186,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='assets/icon.ico',
+    version=_version_file,
 )
 
 coll = COLLECT(

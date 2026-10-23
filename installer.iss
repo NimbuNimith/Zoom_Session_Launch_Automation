@@ -23,7 +23,7 @@
 ; touch (or register over) a real installation.
 
 #define MyAppName "Zoom + Prism Command Center"
-#define MyAppVersion "2.7.3"
+#define MyAppVersion "2.7.4"
 #define MyAppPublisher "upGrad Education"
 #define MyAppExeName "Zoom_Ai_latest.exe"
 
@@ -49,6 +49,12 @@ AppName={#MyAppName}
 #endif
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
+AppCopyright=(c) 2026 upGrad Education
+VersionInfoVersion={#MyAppVersion}.0
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoDescription={#MyAppName} Setup
+VersionInfoProductName={#MyAppName}
+VersionInfoProductVersion={#MyAppVersion}
 ; lowest = always installs per-user (no admin prompt, no "install for
 ; all users?" choice) into {localappdata}\Programs\... — no
 ; PrivilegesRequiredOverridesAllowed line, so Inno Setup never shows
