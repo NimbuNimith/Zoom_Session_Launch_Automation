@@ -1,15 +1,15 @@
 {
-  "version": "2.7.3",
+  "version": "2.7.4",
   "runtime_id": "5d9f12a5a48572aebb564e0b8c61355e",
-  "notes": "Fixes the extra tab and the wait after Zoom sign-in; shared Google Chat room for every moderator's updates; steadier Zoom launches.",
+  "notes": "2.7.4: file properties (version, product, company) now filled in",
   "exe": {
-    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.7.3/Zoom_Ai_latest.exe",
-    "sha256": "5deebb7c90637c7ec35e97295069a23995acc70777d5ef2d3a603f4c0689268d",
-    "size": 12279853
+    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.7.4/Zoom_Ai_latest.exe",
+    "sha256": "fde8285cfa18a49fd75f4657f140f4b204c36b840ea0cc52fe0d699c8f7dbf88",
+    "size": 12280877
   },
   "pack": {
-    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.7.3/CommandCenter_Pack_v2.7.3.zip",
-    "sha256": "62b8c967c37d3db8207acae86c383fee384b599bc70a3a61adc327a1456c2f25",
-    "size": 96436706
+    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.7.4/CommandCenter_Pack_v2.7.4.zip",
+    "sha256": "57ffa348d43cd4bd0668335fe8ce60a3caac476a9bc3a9e6eb95f458ebe6c399",
+    "size": 96438769
   }
 }
