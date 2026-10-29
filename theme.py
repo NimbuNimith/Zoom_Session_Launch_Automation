@@ -295,13 +295,13 @@ QPushButton#AutoPilotBtn:hover {{ background: {AUTOPILOT_HOVER}; }}
 QPushButton#AutoPilotBtn[running="false"] {{ background: {GREEN}; }}
 QPushButton#AutoPilotBtn[running="false"]:hover {{ background: {AUTOPILOT_OFF_HOVER}; }}
 
-QPushButton#ThemeToggleBtn, QPushButton#BellBtn, QPushButton#ChatBtn, QPushButton#AutoStartBtn {{
+QPushButton#ThemeToggleBtn, QPushButton#BellBtn, QPushButton#ChatBtn {{
     background: transparent;
     border: 1px solid {LINE_STRONG};
     border-radius: 15px;
     padding: 5px;
 }}
-QPushButton#ThemeToggleBtn:hover, QPushButton#BellBtn:hover, QPushButton#ChatBtn:hover, QPushButton#AutoStartBtn:hover {{ background: {SURFACE_RAISED}; border-color: {MUTED}; }}
+QPushButton#ThemeToggleBtn:hover, QPushButton#BellBtn:hover, QPushButton#ChatBtn:hover:hover {{ background: {SURFACE_RAISED}; border-color: {MUTED}; }}
 
 /* ── Warning bar (e.g. Prism token couldn't be loaded) ────────────────── */
 #WarnBar {{ background: {SURFACE_RAISED}; border-bottom: 1px solid {AMBER}; }}
