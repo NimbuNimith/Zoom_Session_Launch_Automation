@@ -1520,6 +1520,24 @@ class MainWindow(QMainWindow):
     def _has_real_link(self, m: SessionModel) -> bool:
         return bool(m.join_url) and not m.join_url.startswith(PRISM_PENDING_PREFIX)
 
+    _NO_LINK_LOG_EVERY = 300      # seconds between repeats of the same "no link" line for one session
+
+    def _log_no_prism_link(self, m: SessionModel, data: dict):
+        """Prism answered for this session but gave no join/start link. Says what it did answer (so a
+        log shows whether the meeting is missing, or only the links are), and repeats only every
+        few minutes instead of at every 10-second Auto-Pilot tick."""
+        import time as _t
+        last = self.__dict__.setdefault("_no_link_logged", {})
+        now = _t.monotonic()
+        if now - last.get(m.prism_session_id, -1e9) < self._NO_LINK_LOG_EVERY:
+            return
+        last[m.prism_session_id] = now
+        meeting = "has a meeting but no links" if data.get("Has Meeting") else "has no meeting yet"
+        self.log_event(
+            f"Prism answered for '{m.session_name}' (status {data.get('Status') or '?'}): it {meeting}. "
+            f"Still trying every few seconds. If the session is already listed in Prism with a Start button, "
+            f"this Prism token may not be allowed to see its link.", "warn")
+
     async def _fetch_prism_link(self, url: str) -> bool:
         """Fetches the real join/start URL for a Session-ID-only Prism
         row, right when it's actually needed (see _load_csv_async for
@@ -1551,9 +1569,7 @@ class MainWindow(QMainWindow):
         if not real_url:
             # This is the expected case well before the ~2h window —
             # Prism hasn't generated a link yet. Not an error, just early.
-            self.log_event(
-                f"Prism link not generated yet for '{m.session_name}' "
-                f"(usually appears ~2h before start) — will try again.", "warn")
+            self._log_no_prism_link(m, data)
             self.table_model.set_fields(url, status="⏳ Waiting — No Prism Link Yet")
             return False
 

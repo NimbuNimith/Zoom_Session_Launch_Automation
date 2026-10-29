@@ -49,6 +49,27 @@ def _is_transient(e: GSheetsError) -> bool:
     return e.code == "HTTP_ERROR" and (e.status_code == 404 or e.status_code >= 500)
 
 
+def describe_token(token: str) -> str:
+    """What the token is allowed to do, for the Event Log: its role names and expiry date, read
+    locally from the token's own (unencrypted) payload. Never includes a name, e-mail or id.
+    Returns "" if the token isn't a readable JWT."""
+    import base64, json, time
+    try:
+        part = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+    except Exception:
+        return ""
+    roles = sorted(r for r in (claims.get("realm_access") or {}).get("roles", [])
+                   if not r.startswith("default-roles"))
+    text = f"{len(roles)} roles: {', '.join(roles)}" if roles else "no roles listed"
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)):
+        text += f"; expires {time.strftime('%Y-%m-%d', time.localtime(exp))}"
+        if exp < time.time():
+            text += " (EXPIRED)"
+    return text
+
+
 def get_cached_token() -> str:
     """Synchronous and cheap — safe to call from the threads that build
     Prism request headers. Prefers the Sheet's token, else the built-in one
@@ -87,7 +108,8 @@ async def refresh_token(log_fn=None) -> bool:
             last_reason = f"{type(e).__name__}: {e}"
         else:
             _cached_token = token
-            log("Prism token loaded from the Google Sheet.", "ok")
+            detail = describe_token(token)
+            log("Prism token loaded from the Google Sheet" + (f" ({detail})." if detail else "."), "ok")
             return True
 
     if _BUILT_IN_TOKEN:

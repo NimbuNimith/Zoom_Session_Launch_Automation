@@ -140,6 +140,7 @@ def fetch_sessions(session_ids):
             "Start URL":    vm.get("startUrl", ""),
             "Session Type": vm.get("virtualMeetingFor", ""),
             "Meeting Code": vm.get("code", ""),
+            "Has Meeting":  bool(vm),     # False: Prism returned the session with no meeting object at all
         }
     return by_id
 
