@@ -141,6 +141,7 @@ def fetch_sessions(session_ids):
             "Session Type": vm.get("virtualMeetingFor", ""),
             "Meeting Code": vm.get("code", ""),
             "Has Meeting":  bool(vm),     # False: Prism returned the session with no meeting object at all
+            "Entity":       "workshop" if (ws and not s) else "session",
         }
     return by_id
 

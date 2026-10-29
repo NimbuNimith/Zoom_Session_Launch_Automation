@@ -779,6 +779,7 @@ class MainWindow(QMainWindow):
         self._summary_timer.timeout.connect(self._post_chat_summary)
         self._summary_timer.start()
         self._update_chat_button()
+        self._update_auto_start_button()
         for sig in (self.table_model.dataChanged, self.table_model.rowsInserted, self.table_model.modelReset):
             sig.connect(lambda *a: self.notifier.on_model_changed(self.table_model.all_models()))
         self._build_shortcuts()
@@ -1063,6 +1064,13 @@ class MainWindow(QMainWindow):
         self.btn_chat.clicked.connect(self._on_toggle_chat_feed)
         lay.addWidget(self.btn_chat)
 
+        self.btn_autostart = QPushButton()
+        self.btn_autostart.setObjectName("AutoStartBtn")
+        self.btn_autostart.setCursor(Qt.PointingHandCursor)
+        self.btn_autostart.setFixedSize(30, 30)
+        self.btn_autostart.clicked.connect(self._on_toggle_auto_start)
+        lay.addWidget(self.btn_autostart)
+
         self.btn_bell = QPushButton()
         self.btn_bell.setObjectName("BellBtn")
         self.btn_bell.setCursor(Qt.PointingHandCursor)
@@ -1210,6 +1218,100 @@ class MainWindow(QMainWindow):
             return
         text = f"📋 {len(models)} session(s): {live} live" + (f", {failed} failed" if failed else "") + (f", {closed} window closed" if closed else "")
         self.chat_feed.post(text + f" ({datetime.now().strftime('%H:%M')})")
+
+    # ── Fallback: start the session in Prism when Prism has not made its meeting ──
+    # Prism's scheduler normally creates each session's Zoom meeting ~2 h before the start. When it
+    # doesn't (24 Oct 2026), the meeting only appeared once someone pressed Start Now in Prism - which
+    # is the same "status: started" call this app already makes after joining. With this switched on
+    # (off by default, per PC), the app does that itself, but ONLY in the last 10 minutes before the
+    # start, only for a session that is still yet-to-start and has no meeting at all.
+    PRISM_AUTO_START_KEY = "prism/auto_start_when_no_meeting"
+    PRISM_AUTO_START_WITHIN = 600           # seconds before the start; never earlier
+    _PRISM_AUTO_START_MAX_TRIES = 3
+    _PRISM_AUTO_START_RETRY_AFTER = 30      # seconds between tries for one session
+
+    def _auto_start_enabled(self) -> bool:
+        return bool(get_settings().value(self.PRISM_AUTO_START_KEY, False, type=bool))
+
+    def _update_auto_start_button(self):
+        on = self._auto_start_enabled()
+        self.btn_autostart.setText("\u25B6" if on else "\u25B7")
+        self.btn_autostart.setToolTip(
+            "Auto-start ON: if Prism has not made a session's meeting by 10 minutes before its start, "
+            "this app starts the session in Prism - click to turn off" if on else
+            "Auto-start OFF: when Prism has not made a meeting, you start the session in Prism yourself - click to turn on")
+
+    def _on_toggle_auto_start(self):
+        if not self._auto_start_enabled():
+            if not confirm(self, "Turn on Auto-start?",
+                           "If Prism has NOT created a session's meeting by 10 minutes before the session starts, "
+                           "this app will press 'start' for that session in Prism itself (the same as Start Now), "
+                           "so it shows as started in Prism.\n\nIt never does this earlier than 10 minutes before the "
+                           "start, and only for a session that has no meeting at all.\n\nTurn it on?", danger=False):
+                return
+            get_settings().setValue(self.PRISM_AUTO_START_KEY, True)
+        else:
+            get_settings().setValue(self.PRISM_AUTO_START_KEY, False)
+        self._update_auto_start_button()
+        self.log_event("Auto-start (start the session in Prism when Prism has not made its meeting): "
+                       + ("ON." if self._auto_start_enabled() else "off."), "info")
+
+    @staticmethod
+    def _seconds_to_start(data: dict):
+        """Seconds until Prism's own start time for the session (None if unreadable)."""
+        from datetime import datetime, timezone
+        try:
+            start = datetime.fromisoformat(str(data.get("Starts At", "")).replace("Z", "+00:00"))
+            return (start - datetime.now(timezone.utc)).total_seconds()
+        except Exception:
+            return None
+
+    def _auto_start_target(self, m: SessionModel, data: dict):
+        """(prism_type, ids) for the status call, or None when we can't be sure which call this session
+        needs: only workshop sessions (Prism says so itself) or a type the sheet states explicitly."""
+        sid = m.prism_session_id
+        if data.get("Entity") == "workshop":
+            return "workshop-session", {"session_id": sid}
+        if m.prism_type == "session" and data.get("Entity") == "session":
+            return "session", {"session_id": sid}
+        if m.prism_type == "session-group-session" and data.get("Entity") == "session" and m.prism_session_group_id:
+            return "session-group-session", {"session_group_id": m.prism_session_group_id,
+                                             "session_group_session_id": sid}
+        return None
+
+    async def _try_auto_start_prism(self, m: SessionModel, data: dict) -> bool:
+        """Start this session in Prism if - and only if - every guard holds. True means the call went
+        through (the caller then asks Prism for the link again); the link itself is checked by the caller."""
+        import time as _t
+        if not self._auto_start_enabled() or not m.prism_session_id:
+            return False
+        if data.get("Has Meeting") or data.get("Start URL") or data.get("Join URL"):
+            return False
+        if (data.get("Status") or "") != "yet-to-start":
+            return False
+        secs = self._seconds_to_start(data)
+        if secs is None or not (0 <= secs <= self.PRISM_AUTO_START_WITHIN):
+            return False
+        target = self._auto_start_target(m, data)
+        tries = self.__dict__.setdefault("_auto_start_tries", {})
+        count, last = tries.get(m.prism_session_id, (0, -1e9))
+        if count >= self._PRISM_AUTO_START_MAX_TRIES or _t.monotonic() - last < self._PRISM_AUTO_START_RETRY_AFTER:
+            return False
+        tries[m.prism_session_id] = (count + 1, _t.monotonic())
+        mins = int(secs // 60)
+        if target is None:
+            self.log_event(f"Prism has not created the meeting for '{m.session_name}' and it starts in {mins} min, "
+                           f"but this kind of session can't be auto-started - press Start Now in Prism.", "err")
+            return False
+        from prism_status_push import push_prism_live_status
+        self.log_event(f"Prism has not created the meeting for '{m.session_name}' and it starts in {mins} min - "
+                       f"starting it in Prism now (Auto-start is on).", "warn")
+        try:
+            await asyncio.to_thread(push_prism_live_status, target[0], target[1], "started")
+        except Exception as e:
+            self.log_event(f"Auto-start: Prism refused to start '{m.session_name}' ({e}) - press Start Now in Prism.", "err")
+            return False
+        return True
 
     def _on_check_updates(self):
         from updater import check_for_update
@@ -1586,6 +1688,12 @@ class MainWindow(QMainWindow):
             return False
 
         real_url = data.get("Start URL") or data.get("Join URL")
+        if not real_url and await self._try_auto_start_prism(m, data):
+            try:
+                data = (await fetch_sessions_async([m.prism_session_id])).get(m.prism_session_id) or data
+            except Exception as e:
+                self.log_event(f"Prism link fetch failed for '{m.session_name}' after starting it: {e}", "err")
+            real_url = data.get("Start URL") or data.get("Join URL")
         if not real_url:
             # This is the expected case well before the ~2h window —
             # Prism hasn't generated a link yet. Not an error, just early.
