@@ -1523,20 +1523,40 @@ class MainWindow(QMainWindow):
     _NO_LINK_LOG_EVERY = 300      # seconds between repeats of the same "no link" line for one session
 
     def _log_no_prism_link(self, m: SessionModel, data: dict):
-        """Prism answered for this session but gave no join/start link. Says what it did answer (so a
-        log shows whether the meeting is missing, or only the links are), and repeats only every
-        few minutes instead of at every 10-second Auto-Pilot tick."""
+        """Prism answered for this session but gave no join/start link. Says what Prism did answer, and
+        repeats only every few minutes instead of at every 10-second Auto-Pilot tick.
+
+        The usual reason is that Prism has not created the meeting yet: its scheduler creates every
+        session's Zoom meeting about 2 hours before the start (seen on 2026-10-24, when it skipped three
+        sessions and the meetings only appeared once the moderator pressed Start Now in Prism). Within
+        30 minutes of the start this is an error, so it stands out in the log and the shared chat."""
         import time as _t
+        from datetime import datetime, timezone
+        mins = None
+        try:
+            start = datetime.fromisoformat(str(data.get("Starts At", "")).replace("Z", "+00:00"))
+            mins = int((start - datetime.now(timezone.utc)).total_seconds() // 60)
+        except Exception:
+            pass
+        urgent = mins is not None and mins <= 30
         last = self.__dict__.setdefault("_no_link_logged", {})
+        key = (m.prism_session_id, urgent, bool(data.get("Has Meeting")))
         now = _t.monotonic()
-        if now - last.get(m.prism_session_id, -1e9) < self._NO_LINK_LOG_EVERY:
+        if now - last.get(key, -1e9) < self._NO_LINK_LOG_EVERY:
             return
-        last[m.prism_session_id] = now
-        meeting = "has a meeting but no links" if data.get("Has Meeting") else "has no meeting yet"
-        self.log_event(
-            f"Prism answered for '{m.session_name}' (status {data.get('Status') or '?'}): it {meeting}. "
-            f"Still trying every few seconds. If the session is already listed in Prism with a Start button, "
-            f"this Prism token may not be allowed to see its link.", "warn")
+        last[key] = now
+        when = f" It starts in {mins} min." if mins is not None and mins >= 0 else ""
+        if data.get("Has Meeting"):
+            self.log_event(
+                f"Prism has a meeting for '{m.session_name}' but no join/start link for this token "
+                f"(status {data.get('Status') or '?'}).{when} Still trying; if the session shows a link in Prism, "
+                f"this Prism token may not be allowed to see it.", "err" if urgent else "warn")
+        else:
+            self.log_event(
+                f"Prism has not created the meeting for '{m.session_name}' yet (it normally does this about "
+                f"2 hours before the start).{when} Still checking every few seconds"
+                f"{' - if it stays like this, press Start Now for this session in Prism' if urgent else ''}.",
+                "err" if urgent else "warn")
 
     async def _fetch_prism_link(self, url: str) -> bool:
         """Fetches the real join/start URL for a Session-ID-only Prism
