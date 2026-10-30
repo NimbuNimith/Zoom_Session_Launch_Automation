@@ -755,6 +755,7 @@ class MainWindow(QMainWindow):
         # puts it there) — see browser_setup.py / browser_ui.py.
         from browser_ui import provide_browser
         self.engine.browser_provider = lambda rev: provide_browser(self, rev)
+        self.engine.zoom_start_url_provider = self._fetch_zoom_start_url
         self.auto_pilot_running = False
         self._auto_pilot_timer = QTimer(self)
         self._auto_pilot_timer.setInterval(10_000)
@@ -1279,6 +1280,14 @@ class MainWindow(QMainWindow):
             self.log_event(f"Auto-start: Prism refused to start '{m.session_name}' ({e}) - press Start Now in Prism.", "err")
             return False
         return True
+
+    async def _fetch_zoom_start_url(self, meeting_id: str) -> str:
+        """A meeting's host start link, looked up by the Apps Script with the Zoom credentials it holds."""
+        from gsheets_api_client import create_client_from_settings
+        client = create_client_from_settings()
+        if client is None:
+            raise RuntimeError("no Apps Script address configured")
+        return await asyncio.to_thread(client.fetch_zoom_start_url, meeting_id)
 
     def _on_check_updates(self):
         from updater import check_for_update
