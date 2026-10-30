@@ -25,7 +25,7 @@ import threading
 from datetime import datetime, timedelta
 import time as _time
 
-from PySide6.QtCore import Qt, QTimer, QModelIndex, QUrl, QDate, QMetaObject, Q_ARG, Slot, Signal, QObject, QAbstractTableModel, QThread
+from PySide6.QtCore import Qt, QTimer, QModelIndex, QUrl, QDate, QMetaObject, Q_ARG, Slot, Signal, QObject, QAbstractTableModel
 from PySide6.QtGui import QFont, QColor, QIcon, QDesktopServices
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -58,40 +58,31 @@ def _import_pandas():
     return pandas
 
 
-# Worker class for thread-safe communication with signals
-class ModeratorWorker(QObject):
-    moderators_loaded = Signal(list)
-    error = Signal(str)
-    
-    def __init__(self, client):
-        super().__init__()
-        self.client = client
-    
-    def run(self):
-        try:
-            mods = self.client.fetch_moderators(date.today())
-            self.moderators_loaded.emit(mods)
-        except Exception as e:
-            self.error.emit(str(e))
+class _SheetsCall(QObject):
+    """One Google Sheets request run on a plain background thread; the answer comes back as a signal
+    on the UI thread. It deliberately is NOT a QThread + moveToThread worker: the Sync dialog can be
+    closed while a request is still in flight, and tearing down a still-running QThread (or a worker
+    that lives on it) along with the dialog aborted the whole app. Here the thread only holds this
+    object, the dialog just disconnects it when it closes, and a late answer goes nowhere."""
+    ok = Signal(object)
+    failed = Signal(str, str)
 
-class SessionFetchWorker(QObject):
-    sessions_fetched = Signal(list)
-    error = Signal(str, str)
-    
-    def __init__(self, client, moderator, target_date):
+    def __init__(self, fn):
         super().__init__()
-        self.client = client
-        self.moderator = moderator
-        self.target_date = target_date
-    
-    def run(self):
+        self._fn = fn
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True, name="gsheets-call").start()
+
+    def _run(self):
         try:
-            sessions = self.client.fetch_sessions(self.moderator, self.target_date)
-            self.sessions_fetched.emit(sessions)
+            result = self._fn()
         except GSheetsError as e:
-            self.error.emit(e.code, e.message)
+            self.failed.emit(e.code, e.message)
         except Exception as e:
-            self.error.emit("EXCEPTION", str(e))
+            self.failed.emit("EXCEPTION", str(e))
+        else:
+            self.ok.emit(result)
 
 
 def _log_colors():
@@ -480,7 +471,8 @@ class GSheetsSyncDialog(QDialog):
         self.parent_window = parent
         self.client = GSheetsAPIClient(apps_script_url)
         self.fetched_sessions: list[dict] = []
-        
+        self._calls: list[_SheetsCall] = []
+
         self.setWindowTitle("Sync from Google Sheets")
         self.setWindowIcon(_app_icon())
         self.setMinimumSize(900, 600)
@@ -574,32 +566,27 @@ class GSheetsSyncDialog(QDialog):
         self.fetch_btn.setText("Loading moderators...")
         self.status_label.setText("Fetching moderator list...")
         
-        # Clean up any existing worker
-        if hasattr(self, '_moderator_worker') and self._moderator_worker is not None:
-            self._moderator_worker.deleteLater()
-        if hasattr(self, '_moderator_thread') and self._moderator_thread is not None:
-            self._moderator_thread.quit()
-            self._moderator_thread.wait()
-            
-        # Create worker and thread
-        self._moderator_worker = ModeratorWorker(self.client)
-        self._moderator_thread = QThread()
-        self._moderator_worker.moveToThread(self._moderator_thread)
-        
-        # Connect signals
-        self._moderator_worker.moderators_loaded.connect(self._on_moderators_loaded)
-        self._moderator_worker.error.connect(self._on_moderators_error)
-        self._moderator_thread.started.connect(self._moderator_worker.run)
-        self._moderator_worker.moderators_loaded.connect(self._moderator_thread.quit)
-        self._moderator_worker.error.connect(self._moderator_thread.quit)
-        self._moderator_worker.moderators_loaded.connect(self._moderator_worker.deleteLater)
-        self._moderator_worker.error.connect(self._moderator_worker.deleteLater)
-        self._moderator_thread.finished.connect(self._moderator_thread.deleteLater)
-        
-        # Start the thread
-        self._moderator_thread.start()
-    
-    @Slot(list)
+        call = _SheetsCall(lambda: self.client.fetch_moderators(date.today()))
+        call.ok.connect(self._on_moderators_loaded)
+        call.failed.connect(self._on_moderators_error)
+        self._start_call(call)
+
+    def _start_call(self, call: "_SheetsCall"):
+        self._calls.append(call)
+        call.start()
+
+    def done(self, result):
+        """Closing the dialog (X, Cancel, Esc, Load) while a request is still running must not touch
+        widgets that are going away: cut the connections, the request then ends unheard."""
+        for call in self._calls:
+            for sig in (call.ok, call.failed):
+                try:
+                    sig.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+        super().done(result)
+
+    @Slot(object)
     def _on_moderators_loaded(self, mods: list):
         self.moderator_combo.clear()
         self.moderator_combo.addItems(mods)
@@ -607,8 +594,8 @@ class GSheetsSyncDialog(QDialog):
         self.fetch_btn.setText("Fetch Sessions")
         self.status_label.setText(f"Found {len(mods)} moderators for today")
     
-    @Slot(str)
-    def _on_moderators_error(self, error: str):
+    @Slot(str, str)
+    def _on_moderators_error(self, code: str, error: str):
         self.fetch_btn.setEnabled(True)
         self.fetch_btn.setText("Fetch Sessions")
         self.status_label.setText(f"Error loading moderators: {error}")
@@ -628,32 +615,12 @@ class GSheetsSyncDialog(QDialog):
         self.status_label.setText(f"Fetching sessions for {moderator} on {target_date}...")
         self.load_btn.setEnabled(False)
         
-        # Clean up any existing worker
-        if hasattr(self, '_fetch_worker') and self._fetch_worker is not None:
-            self._fetch_worker.deleteLater()
-        if hasattr(self, '_fetch_thread') and self._fetch_thread is not None:
-            self._fetch_thread.quit()
-            self._fetch_thread.wait()
-            
-        # Create worker and thread
-        self._fetch_worker = SessionFetchWorker(self.client, moderator, target_date)
-        self._fetch_thread = QThread()
-        self._fetch_worker.moveToThread(self._fetch_thread)
-        
-        # Connect signals
-        self._fetch_worker.sessions_fetched.connect(self._on_fetch_complete)
-        self._fetch_worker.error.connect(self._on_fetch_error)
-        self._fetch_thread.started.connect(self._fetch_worker.run)
-        self._fetch_worker.sessions_fetched.connect(self._fetch_thread.quit)
-        self._fetch_worker.error.connect(self._fetch_thread.quit)
-        self._fetch_worker.sessions_fetched.connect(self._fetch_worker.deleteLater)
-        self._fetch_worker.error.connect(self._fetch_worker.deleteLater)
-        self._fetch_thread.finished.connect(self._fetch_thread.deleteLater)
-        
-        # Start the thread
-        self._fetch_thread.start()
-    
-    @Slot(list)
+        call = _SheetsCall(lambda: self.client.fetch_sessions(moderator, target_date))
+        call.ok.connect(self._on_fetch_complete)
+        call.failed.connect(self._on_fetch_error)
+        self._start_call(call)
+
+    @Slot(object)
     def _on_fetch_complete(self, sessions: list):
         self.fetched_sessions = sessions
         self.preview_model.set_sessions(sessions)
