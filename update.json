@@ -1,15 +1,15 @@
 {
-  "version": "2.7.4",
+  "version": "2.8.0",
   "runtime_id": "5d9f12a5a48572aebb564e0b8c61355e",
-  "notes": "2.7.4: file properties (version, product, company) now filled in",
+  "notes": "2.8.0: host start links come from the Zoom API (no Zoom web sign-in); Prism auto-start fallback 10 minutes before the start; hidden links in logs",
   "exe": {
-    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.7.4/Zoom_Ai_latest.exe",
-    "sha256": "fde8285cfa18a49fd75f4657f140f4b204c36b840ea0cc52fe0d699c8f7dbf88",
-    "size": 12280877
+    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.8.0/Zoom_Ai_latest.exe",
+    "sha256": "0bc45e6bd18f993d87c13afb6b584bd9422522217a97f1401ab60a96c5f49895",
+    "size": 12291384
   },
   "pack": {
-    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.7.4/CommandCenter_Pack_v2.7.4.zip",
-    "sha256": "57ffa348d43cd4bd0668335fe8ce60a3caac476a9bc3a9e6eb95f458ebe6c399",
-    "size": 96438769
+    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.8.0/CommandCenter_Pack_v2.8.0.zip",
+    "sha256": "89d90c74b9d8c68ba1b013b391a419c7aef233c7fcec2c00b72350ac430a249d",
+    "size": 96447355
   }
 }
