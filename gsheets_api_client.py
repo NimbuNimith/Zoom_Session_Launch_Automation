@@ -213,6 +213,35 @@ class GSheetsAPIClient:
             raise GSheetsError('EMPTY_WEBHOOK', 'The script returned success but no webhook URL', resp.status_code)
         return url
 
+    def fetch_zoom_start_url(self, meeting_id: str) -> str:
+        """One meeting's host START link, looked up by the Apps Script with the Zoom credentials it
+        holds (`action=zoom_start_url`; the credentials never reach this app). Needs this build's app
+        key (zoom_start.app_key). Raises GSheetsError like fetch_token; the script's own refusals come
+        back as codes such as FORBIDDEN, NOT_DUE, RATE_LIMITED, ZOOM_NOT_CONFIGURED, ZOOM_API_ERROR."""
+        from zoom_start import app_key
+        key = app_key()
+        if not key:
+            raise GSheetsError('ZOOM_NOT_CONFIGURED', 'This build has no Zoom app key', 0)
+        try:
+            resp = self.session.get(self.base_url, timeout=self.timeout,
+                                    params={'action': 'zoom_start_url', 'meeting_id': meeting_id, 'key': key})
+        except requests.Timeout:
+            raise GSheetsError('TIMEOUT', f'Request timed out after {self.timeout}s', 408)
+        except requests.RequestException as e:
+            raise GSheetsError('NETWORK_ERROR', f'Network error: {type(e).__name__}', 0)
+        if resp.status_code != 200:
+            raise GSheetsError('HTTP_ERROR', f'Status {resp.status_code}', resp.status_code)
+        try:
+            data = resp.json()
+        except ValueError:
+            raise GSheetsError('INVALID_JSON', 'Response is not valid JSON', resp.status_code)
+        if not data.get('success'):
+            raise GSheetsError(data.get('error', 'UNKNOWN'), data.get('message', ''), resp.status_code)
+        url = str(data.get('start_url') or '').strip()
+        if not url:
+            raise GSheetsError('ZOOM_NO_START_URL', 'The script returned success but no start link', resp.status_code)
+        return url
+
     def _normalize_session(self, raw: Dict[str, Any]) -> Dict[str, str]:
         """Ensure all CSV_FORMAT.md columns exist with string values."""
         csv_columns = [

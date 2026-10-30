@@ -34,6 +34,7 @@ from playwright.async_api import async_playwright
 
 from models import SessionModel, SessionTableModel
 from browser_setup import required_revision, browser_exe_path, remove_other_revisions
+from zoom_start import valid_start_url, redact_secrets
 from prism_status_push import push_prism_live_status_async
 
 MAX_SESSIONS_PER_ACCOUNT = 2
@@ -52,6 +53,8 @@ SIGNIN_SLOW_EXTRA_SECONDS = 140   # a sign-in whose button is still spinning aft
 LOW_MEMORY_PERCENT = 10           # warn when less than this much RAM is free as a launch starts
 SHARE_ACCOUNT_SIGNIN = True       # one sign-in per Zoom account, reused by its other sessions (see _AccountAuth); False = every session signs in itself
 SIGNIN_ATTEMPTS = 3
+ZOOM_API_START_ENABLED = True     # use the Zoom API start link (no sign-in) when the Apps Script can give one; False = always sign in
+ZOOM_API_TIMEOUT_SECONDS = 25     # the Apps Script has to wake up, get a Zoom token and look the meeting up
 RECAPTCHA_ERROR_TEXT = "could not connect to the recaptcha service"
 RECAPTCHA_PERSIST_SECONDS = 8            # error must stay on screen this long before it counts
 
@@ -169,6 +172,12 @@ def build_launch_url(mid: str, raw_url: str, mode: str = "start") -> str:
     if zak: params.append(f"zak={zak.group(1)}")
     if pwd: params.append(f"pwd={pwd.group(1)}")
     return base + ("?" + "&".join(params) if params else "")
+
+
+def zoom_api_launch_url(mid: str, start_url: str) -> str:
+    """Web-client launch address for a host start link from the Zoom API, on the same upgrad.zoom.us
+    host the sign-in flow uses (the link's own host is a regional one)."""
+    return re.sub(r"^https://[^/]+/", "https://upgrad.zoom.us/", build_launch_url(mid, start_url, mode="start"))
 
 
 _SIGNIN_SKIP_SEL = ("button:has-text('Skip for now'), a:has-text('Skip for now'), "
@@ -360,7 +369,9 @@ class _AccountAuth:
 class Engine:
     def __init__(self, model: SessionTableModel, log_fn):
         self.model = model
-        self.log = log_fn                      # callable(msg: str, level: str)
+        # callable(msg: str, level: str). Everything the engine logs passes through redact_secrets first: error
+        # texts and "stuck at <url>" lines can contain a start link's zak= token (see zoom_start.redact_secrets).
+        self.log = lambda msg, level="info": log_fn(redact_secrets(msg), level)
         self.running_locks: set[str] = set()
         self.active_accounts: dict[str, set[str]] = {}
         self.guest_pages: list = []
@@ -369,6 +380,8 @@ class Engine:
         self._page_locks: dict[str, asyncio.Lock] = {}       # url -> lock, see _page_lock_for()
         self.browser_ready = False
         self.browser_provider = None   # async (revision) -> chrome.exe path; set by MainWindow
+        self.zoom_start_url_provider = None   # async (meeting id) -> host start link; set by MainWindow
+        self._zoom_api_noted: set = set()     # problems already explained once this run
         self.downloading_browser = False   # True during the one-time browser download (start-up window steps aside)
         self._playwright = None
         self._browser = None
@@ -752,6 +765,30 @@ class Engine:
         self.model.set_fields(url, status="👤 Joining...", action="...")
         asyncio.create_task(self._launch_zoom_task(url, m, mode="GUEST"))
 
+    async def _zoom_api_start_url(self, m: SessionModel) -> str:
+        """The session's host start link from the Zoom API (looked up by the Apps Script, which alone
+        holds the Zoom credentials), or "" to sign in the usual way. Never raises, never logs the link."""
+        provider = self.zoom_start_url_provider
+        mid = m.zoom_meeting_id()
+        if not ZOOM_API_START_ENABLED or provider is None or not mid:
+            return ""
+        try:
+            url = await asyncio.wait_for(provider(mid), timeout=ZOOM_API_TIMEOUT_SECONDS)
+        except Exception as e:
+            code = getattr(e, "code", "") or type(e).__name__
+            quiet = {"ZOOM_NOT_CONFIGURED", "FORBIDDEN", "MISSING_PARAMS", "TimeoutError"}
+            if code in quiet:
+                if code not in self._zoom_api_noted:
+                    self._zoom_api_noted.add(code)
+                    self.log(f"Zoom API start links are not available here ({code}) - signing in the usual way.", "info")
+            else:
+                self.log(f"Zoom API: no start link for {m.session_name} ({code}) - signing in the usual way.", "warn")
+            return ""
+        if not valid_start_url(url):
+            self.log(f"Zoom API: the start link for {m.session_name} looked wrong - signing in the usual way.", "warn")
+            return ""
+        return url
+
     async def _launch_zoom_task(self, url: str, m: SessionModel, mode: str = "HOST"):
         delay = random.uniform(2, 6)
         await asyncio.sleep(delay)
@@ -784,8 +821,11 @@ class Engine:
                 self.model.set_fields(url, status="🚀 Queued (waiting for a free slot)...")
             await self._launch_gate.acquire()
             gate_held = True
+            # HOST launches first ask for a start link from the Zoom API: with one, there is no sign-in
+            # (Zoom's sign-in page refuses the automated browser's email step with a 403).
+            api_start_url = await self._zoom_api_start_url(m) if mode == "HOST" else ""
             context_kwargs = {}
-            if mode == "HOST" and len(email) > 3 and SHARE_ACCOUNT_SIGNIN:
+            if mode == "HOST" and len(email) > 3 and SHARE_ACCOUNT_SIGNIN and not api_start_url:
                 auth = self._account_auth.setdefault(email, _AccountAuth())
                 # One session of an account signs in at a time; the next one waits here and
                 # then starts from the first one's cookies instead of signing in again.
@@ -814,7 +854,7 @@ class Engine:
                 await context.add_init_script(_BLOCK_POPUPS_JS)
             self._watch_popups(context, page, m.session_name)
 
-            if mode == "HOST" and len(email) > 3:
+            if mode == "HOST" and len(email) > 3 and not api_start_url:
                 self.model.set_fields(url, status="🔑 Logging in...", action="...")
                 self.log(f"Logging in as {email}...", "info")
                 # Zoom's sign-in redirect can land on a different host
@@ -1036,6 +1076,9 @@ class Engine:
             mid = m.zoom_meeting_id() or ""
             target = (f"https://upgrad.zoom.us/wc/{mid}/start"
                       if (mode == "HOST" and email) else f"https://upgrad.zoom.us/wc/{mid}/join")
+            if api_start_url:
+                self.log(f"Starting {m.session_name} with a Zoom API start link - no sign-in needed.", "info")
+                target = zoom_api_launch_url(mid, api_start_url)
             await self._goto_with_retry(page, target, m.session_name)
             release_gate()      # the page is loaded: the next queued launch may start
 

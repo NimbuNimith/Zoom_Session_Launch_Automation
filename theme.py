@@ -301,7 +301,7 @@ QPushButton#ThemeToggleBtn, QPushButton#BellBtn, QPushButton#ChatBtn {{
     border-radius: 15px;
     padding: 5px;
 }}
-QPushButton#ThemeToggleBtn:hover, QPushButton#BellBtn:hover, QPushButton#ChatBtn:hover {{ background: {SURFACE_RAISED}; border-color: {MUTED}; }}
+QPushButton#ThemeToggleBtn:hover, QPushButton#BellBtn:hover, QPushButton#ChatBtn:hover:hover {{ background: {SURFACE_RAISED}; border-color: {MUTED}; }}
 
 /* ── Warning bar (e.g. Prism token couldn't be loaded) ────────────────── */
 #WarnBar {{ background: {SURFACE_RAISED}; border-bottom: 1px solid {AMBER}; }}
