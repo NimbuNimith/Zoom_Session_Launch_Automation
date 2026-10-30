@@ -1,15 +1,15 @@
 {
-  "version": "2.8.0",
+  "version": "2.8.1",
   "runtime_id": "5d9f12a5a48572aebb564e0b8c61355e",
-  "notes": "2.8.0: host start links come from the Zoom API (no Zoom web sign-in); Prism auto-start fallback 10 minutes before the start; hidden links in logs",
+  "notes": "2.8.1: closing the Sync from Google Sheets window while it is still loading no longer crashes the app",
   "exe": {
-    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.8.0/Zoom_Ai_latest.exe",
-    "sha256": "0bc45e6bd18f993d87c13afb6b584bd9422522217a97f1401ab60a96c5f49895",
-    "size": 12291384
+    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.8.1/Zoom_Ai_latest.exe",
+    "sha256": "0be8616ece1752930193b549864605c390b87b13698bfad0360e428e19d0ddfc",
+    "size": 12291272
   },
   "pack": {
-    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.8.0/CommandCenter_Pack_v2.8.0.zip",
-    "sha256": "89d90c74b9d8c68ba1b013b391a419c7aef233c7fcec2c00b72350ac430a249d",
-    "size": 96447355
+    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.8.1/CommandCenter_Pack_v2.8.1.zip",
+    "sha256": "0bd9f7d10455c9dae432630d55c27b3b796e3867a6ab6f4130f1da755739ef15",
+    "size": 96448612
   }
 }
