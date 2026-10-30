@@ -23,7 +23,7 @@
 ; touch (or register over) a real installation.
 
 #define MyAppName "Zoom + Prism Command Center"
-#define MyAppVersion "2.7.7"
+#define MyAppVersion "2.8.0"
 #define MyAppPublisher "upGrad Education"
 #define MyAppExeName "Zoom_Ai_latest.exe"
 
