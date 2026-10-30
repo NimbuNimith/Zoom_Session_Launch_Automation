@@ -1,5 +1,5 @@
 {
-  "version": "2.7.4",
+  "version": "1.0.0",
   "runtime_id": "5d9f12a5a48572aebb564e0b8c61355e",
   "notes": "2.7.4: file properties (version, product, company) now filled in",
   "exe": {
