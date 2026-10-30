@@ -34,6 +34,16 @@ def app_key() -> str:
         return ""
 
 
+_SECRET_PARAM = re.compile(r"((?:zak|pwd|tk|token|access_token)=)[^&\s\"'<>)}\]]+", re.IGNORECASE)
+
+
+def redact_secrets(text):
+    """Hides the value of zak= / pwd= / tk= / token= in a log line. A host start link carries a token that can
+    start the meeting as host, and Playwright's error messages (and our own 'stuck at <url>' lines) include
+    the address they were working on, so every engine log line goes through this first."""
+    return _SECRET_PARAM.sub(r"\1<hidden>", text) if isinstance(text, str) else text
+
+
 def valid_start_url(url) -> bool:
     """A host start link must be https, on a zoom.us address, and carry the host token (zak=...).
     Anything else is not used (the sign-in path takes over)."""

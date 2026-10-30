@@ -34,7 +34,7 @@ from playwright.async_api import async_playwright
 
 from models import SessionModel, SessionTableModel
 from browser_setup import required_revision, browser_exe_path, remove_other_revisions
-from zoom_start import valid_start_url
+from zoom_start import valid_start_url, redact_secrets
 from prism_status_push import push_prism_live_status_async
 
 MAX_SESSIONS_PER_ACCOUNT = 2
@@ -369,7 +369,9 @@ class _AccountAuth:
 class Engine:
     def __init__(self, model: SessionTableModel, log_fn):
         self.model = model
-        self.log = log_fn                      # callable(msg: str, level: str)
+        # callable(msg: str, level: str). Everything the engine logs passes through redact_secrets first: error
+        # texts and "stuck at <url>" lines can contain a start link's zak= token (see zoom_start.redact_secrets).
+        self.log = lambda msg, level="info": log_fn(redact_secrets(msg), level)
         self.running_locks: set[str] = set()
         self.active_accounts: dict[str, set[str]] = {}
         self.guest_pages: list = []
