@@ -35,6 +35,7 @@ from playwright.async_api import async_playwright
 from models import SessionModel, SessionTableModel
 from browser_setup import required_revision, browser_exe_path, remove_other_revisions
 from zoom_start import valid_start_url, redact_secrets
+from network_watch import NetworkWatch, probe_once, CHECK_EVERY as NETWORK_CHECK_EVERY
 from prism_status_push import push_prism_live_status_async
 
 MAX_SESSIONS_PER_ACCOUNT = 2
@@ -51,6 +52,7 @@ MAX_CONCURRENT_LAUNCHES = 3       # sessions loading at the same time; the rest 
 SIGNIN_WAIT_SECONDS = 100         # how long to wait for the password form to go away after pressing Sign in
 SIGNIN_SLOW_EXTRA_SECONDS = 140   # a sign-in whose button is still spinning after 100 s is given up to this much longer
 LOW_MEMORY_PERCENT = 10           # warn when less than this much RAM is free as a launch starts
+NETWORK_WATCH_ENABLED = True      # warn in the Event Log when the internet turns slow or flaky while sessions are open (network_watch.py)
 SHARE_ACCOUNT_SIGNIN = True       # one sign-in per Zoom account, reused by its other sessions (see _AccountAuth); False = every session signs in itself
 SIGNIN_ATTEMPTS = 3
 ZOOM_API_START_ENABLED = True     # use the Zoom API start link (no sign-in) when the Apps Script can give one; False = always sign in
@@ -392,6 +394,8 @@ class Engine:
         self._account_auth: dict[str, _AccountAuth] = {}   # host email -> its shared sign-in
         self._launch_gate = asyncio.Semaphore(MAX_CONCURRENT_LAUNCHES)
         self._last_memory_warning = 0.0
+        self._network_watch = NetworkWatch()
+        self.network_probe = probe_once       # blocking () -> {name: seconds or None}; replaceable in tests
 
     # ── Startup ──────────────────────────────────────────────────────
     async def start(self):
@@ -466,6 +470,26 @@ class Engine:
         self._tasks.append(asyncio.create_task(self._fast_live_loop()))
         self._tasks.append(asyncio.create_task(self._status_text_loop()))
         self._tasks.append(asyncio.create_task(self._participant_scan_loop()))
+        self._tasks.append(asyncio.create_task(self._network_watch_loop()))
+
+    async def _network_watch_loop(self):
+        """Every CHECK_EVERY seconds. Never raises: a failing check must not take the other loops with it."""
+        while True:
+            await asyncio.sleep(NETWORK_CHECK_EVERY)
+            try:
+                await self._network_tick()
+            except Exception:
+                pass
+
+    async def _network_tick(self):
+        """One check, only while at least one session window is open (nothing to protect otherwise)."""
+        if not NETWORK_WATCH_ENABLED or not self.browser_ready:
+            return
+        if not any(m.page is not None and not m.page.is_closed() for m in self.model.all_models()):
+            return
+        sample = await asyncio.to_thread(self.network_probe)
+        for kind, text in self._network_watch.add(sample):
+            self.log(text, "warn" if kind == "poor" else "info")
 
     async def shutdown(self):
         """Bounded, step-by-step teardown. This is called inside a 5s
