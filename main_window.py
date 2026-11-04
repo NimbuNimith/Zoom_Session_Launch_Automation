@@ -1953,7 +1953,7 @@ class MainWindow(QMainWindow):
                     self.log_event(
                         f"Auto-Pilot: launching '{poll_name}' for '{m.session_name}' "
                         f"({diff:.0f}m to end)", "info")
-                    self.engine.launch_poll(m.join_url, poll_name)
+                    self.engine.launch_poll(m.join_url, poll_name, auto=True)
             except Exception:
                 pass
 

@@ -1450,8 +1450,9 @@ class Engine:
         m = self.model.get(url)
         return (m.selected_poll if m else "") or DEFAULT_POLL_NAME
 
-    def launch_poll(self, url: str, poll_name: str = None):
-        """Single-session poll launch — the Poll Action cell click."""
+    def launch_poll(self, url: str, poll_name: str = None, auto: bool = False):
+        """Single-session poll launch — the Poll Action cell click, or (auto=True) Auto-Pilot's one automatic
+        launch before the end, which must never put a poll that already ran to the learners a second time."""
         poll_name = poll_name or DEFAULT_POLL_NAME
         m = self.model.get(url)
         ok, reason = self._poll_preflight(url)
@@ -1461,9 +1462,9 @@ class Engine:
             return
         self.model.set_fields(url, poll_status="Launching...", poll_action="...")
         self.log(f"Launching poll '{poll_name}' for '{m.session_name}'...", "info")
-        asyncio.create_task(self._launch_poll_task(url, poll_name, ""))
+        asyncio.create_task(self._launch_poll_task(url, poll_name, "", allow_relaunch=not auto))
 
-    async def _launch_poll_task(self, url: str, poll_name: str, prefix: str) -> bool:
+    async def _launch_poll_task(self, url: str, poll_name: str, prefix: str, allow_relaunch: bool = True) -> bool:
         """Participants → More → Polls → <poll_name> → Launch, reusing
         the session's existing Playwright page — no new browser tabs or
         contexts. Retries once on failure before giving up (
@@ -1480,9 +1481,21 @@ class Engine:
                         m.page, poll_name, is_prism=m.is_prism(),
                         on_quiz=lambda: self.log(
                             f"{prefix}'{poll_name}' is a Quiz in '{m.session_name}' (there is no Poll with "
-                            f"that name) - launching it as a Quiz.", "warn"))
+                            f"that name) - launching it as a Quiz.", "warn"),
+                        allow_relaunch=allow_relaunch)
                 m.poll_launching = False
-                if kind == "quiz":
+                if kind == "already_running":
+                    self.model.set_fields(url, poll_status=f"{prefix}Poll Live", poll_action="Launch Poll")
+                    self.log(f"{prefix}Poll '{poll_name}' is already running in '{m.session_name}' - nothing to launch.", "info")
+                elif kind == "already_running_not_host":
+                    self.model.set_fields(url, poll_status=f"{prefix}Poll Live", poll_action="Launch Poll")
+                    self.log(f"{prefix}Poll '{poll_name}' is already open in '{m.session_name}' (started by someone else) - "
+                             f"this account is not the host there, so it can't manage the poll.", "warn")
+                elif kind == "already_ended":
+                    self.model.set_fields(url, poll_status=f"{prefix}Poll Ended", poll_action="Launch Poll")
+                    self.log(f"{prefix}Poll '{poll_name}' already ran and ended in '{m.session_name}' - not launching it again "
+                             f"(use the Poll button to launch it again by hand).", "info")
+                elif kind == "quiz":
                     self.model.set_fields(url, poll_status=f"{prefix}Quiz Live", poll_action="Launch Poll")
                     self.log(f"{prefix}Quiz '{poll_name}' launched for '{m.session_name}' (as a Quiz, not a Poll).", "ok")
                 else:
@@ -2489,13 +2502,169 @@ async def _click_launch_on_row(page, title_loc) -> bool:
     raise RuntimeError("Launch button not found within this poll's own row")
 
 
-async def _do_launch_poll_once(page, poll_name: str, is_prism: bool = False, on_quiz=None) -> str:
+# What the Polls/Quizzes panel is showing. Mapped live on 2026-11-04 (old test meeting): the panel is NOT always
+# the list of polls. "Launch button not found within this poll's own row" was this panel showing one of the
+# other three views, not a missing button.
+#   list    - the poll rows (Launch appears on the hovered row)
+#   running - "< Back", the poll's title, a timer, "End Poll"      (a host / co-host view of a running poll)
+#   ended   - "< Back", the poll's title, "Ended", "Share Result"   (needs "< Back" to reach the list again)
+#   voter   - the poll as a form to fill in: "n of m answered" + "Submit" (this account is not the host)
+_POLL_PANEL_STATE_JS = """() => {
+  let best = null;
+  for (const el of document.querySelectorAll('div, section, aside')) {
+    const t = el.innerText || '';
+    if (t.includes('Polls/Quizzes') && /available for this meeting/i.test(t)) {
+      const r = el.getBoundingClientRect();
+      if (r.width > 200 && r.height > 120 && (!best || r.width * r.height < best.area)) best = {el, area: r.width * r.height};
+    }
+  }
+  if (!best) return null;
+  const el = best.el;
+  const lines = (el.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+  const btn = [...el.querySelectorAll('button, [role=button]')].filter(b => { const q = b.getBoundingClientRect(); return q.width > 3 && q.height > 3; })
+    .map(b => (b.innerText || '').trim());
+  const has = rx => btn.some(t => rx.test(t));
+  const rows = [...el.querySelectorAll('.poll-list-item__topic-name')].filter(b => { const q = b.getBoundingClientRect(); return q.width > 3 && q.height > 3; }).length;
+  let title = '';
+  const back = lines.findIndex(l => /^<\\s*back$/i.test(l));
+  if (back >= 0) title = lines[back + 1] || '';
+  else { const i = lines.findIndex(l => /available for this meeting/i.test(l)); if (i >= 0) title = lines[i + 1] || ''; }
+  let kind = 'unknown';
+  if (rows > 0) kind = 'list';
+  else if (has(/^end poll$/i) || has(/^end quiz$/i)) kind = 'running';
+  else if (has(/^share result/i)) kind = 'ended';
+  else if (has(/^submit$/i) && lines.some(l => /\\d+\\s+of\\s+\\d+\\s+answered/i.test(l))) kind = 'voter';
+  return {kind, title};
+}"""
+
+
+async def _polls_panel_state(page) -> tuple[str, str]:
+    """(kind, title) - see _POLL_PANEL_STATE_JS. ("closed", "") when the panel is not on screen, ("unknown", "")
+    when it is open but none of the known views; never raises."""
+    try:
+        got = await page.evaluate(_POLL_PANEL_STATE_JS)
+    except Exception:
+        return "unknown", ""
+    if not got:
+        return "closed", ""
+    return got.get("kind", "unknown"), (got.get("title") or "").strip()
+
+
+async def _polls_back_to_list(page):
+    """From a running/ended poll's own view back to the list of polls ('< Back')."""
+    back = page.get_by_role("button", name=re.compile(r"^\s*<?\s*back\s*$", re.IGNORECASE)).filter(visible=True)
+    if await back.count() == 0:
+        back = page.get_by_text(re.compile(r"^\s*<\s*Back\s*$")).filter(visible=True)
+    if await back.count() == 0:
+        raise RuntimeError("the Polls panel is showing a poll's own view and its '< Back' button was not found")
+    await _hover_click(page, back.first)
+    for _ in range(16):                            # up to 4 s for the list to come back
+        await asyncio.sleep(0.25)
+        if (await _polls_panel_state(page))[0] == "list":
+            return
+    raise RuntimeError("clicked '< Back' in the Polls panel but the list of polls did not come back")
+
+
+async def _poll_row_container(row):
+    """The whole row of this poll: the largest ancestor of its title that still holds only that one poll title."""
+    best = None
+    for levels in range(1, 10):
+        try:
+            cont = row.locator(f"xpath=ancestor::*[{levels}]")
+            n = await cont.locator(".poll-list-item__topic-name").count()
+        except Exception:
+            continue
+        if n == 1:
+            best = cont
+        elif n > 1:
+            break
+    return best
+
+
+async def _poll_row_results_button(row):
+    """The row's 'View Results' button when the poll already ran (its row then reads 'Ended' and has no Launch
+    button), else None. The label renders with the title, the button a moment later, so once the row says
+    'Ended' it is given up to 3 s to show."""
+    cont = await _poll_row_container(row)
+    if cont is None:
+        return None
+    # The row's details ("Ended", "Poll", "5 questions") can render a moment after its title: wait for the
+    # question count before judging, or an ended poll is mistaken for one that was simply never launched.
+    text = ""
+    try:
+        for _ in range(10):
+            text = await cont.inner_text(timeout=2000)
+            if re.search(r"\d+\s*questions?", text, re.IGNORECASE):
+                break
+            await asyncio.sleep(0.2)
+    except Exception:
+        return None
+    if not re.search(r"\bEnded\b", text):
+        return None
+    for _ in range(12):
+        btn = cont.get_by_role("button", name=re.compile(r"view results", re.IGNORECASE)).filter(visible=True)
+        if await btn.count() > 0:
+            return btn.first
+        await asyncio.sleep(0.25)
+    return None
+
+
+async def _relaunch_from_results(page):
+    """From a finished poll's results view: options menu -> 'Re-launch Poll' (a poll that already ran has no
+    Launch button in the list, only 'View Results'; this menu is where Zoom keeps the way to run it again)."""
+    opt = page.locator(".poll-footer-right__option-button").filter(visible=True)
+    if await opt.count() == 0:
+        raise RuntimeError("the poll's results view has no options button, so it cannot be re-launched")
+    await _hover_click(page, opt.first)
+    item = page.get_by_text(re.compile(r"^\s*Re-?launch Poll\s*$", re.IGNORECASE)).filter(visible=True)
+    for _ in range(8):
+        if await item.count() > 0:
+            break
+        await asyncio.sleep(0.25)
+    if await item.count() == 0:
+        raise RuntimeError("'Re-launch Poll' was not in the results view's options menu")
+    await _bbox_settled(item.first)
+    await _hover_click(page, item.first)
+    if not await _wait_poll_started(page, 9.0):
+        raise RuntimeError("clicked 'Re-launch Poll' but the poll never started - " + await _polls_debug(page))
+
+
+async def _do_launch_poll_once(page, poll_name: str, is_prism: bool = False, on_quiz=None,
+                               allow_relaunch: bool = True) -> str:
     """Single attempt: Participants → More → Polls → <poll_name> →
     Launch. Raises on failure so the caller (Engine._launch_poll_task)
     can retry / mark as Failed. Returns "poll", or "quiz" when the meeting had no Poll
     with that name but exactly one Quiz did and that was launched instead (on_quiz() is
-    called just before it is, so the caller can log the warning)."""
+    called just before it is, so the caller can log the warning).
+
+    Also returns, without launching anything, when the panel shows that there is nothing to launch:
+    "already_running" (this poll is already running - someone started it, or an earlier attempt did),
+    "already_running_not_host" (same, but seen as the voter form: this account is not the host) and
+    "already_ended" (this poll already ran and ended, and `allow_relaunch` is False - Auto-Pilot must
+    not put the same poll to the learners twice). Another poll running raises PollNotAvailable."""
     await _open_polls_panel(page)   # raises a specific RuntimeError on failure
+
+    pkind, ptitle = await _polls_panel_state(page)
+    same = bool(ptitle) and ptitle.casefold() == poll_name.casefold()
+    if pkind == "voter":
+        if same:
+            return "already_running_not_host"
+        raise PollNotAvailable(
+            f"Another poll ('{ptitle or 'unknown'}') is open in this meeting and this account is not the host, so it "
+            f"cannot launch '{poll_name}'.", "Failed: not host")
+    if pkind == "running":
+        if same:
+            return "already_running"
+        raise PollNotAvailable(
+            f"Another poll ('{ptitle or 'unknown'}') is running in this meeting - it has to be ended before "
+            f"'{poll_name}' can be launched.", "Failed: other poll running")
+    if pkind == "ended":
+        if same:
+            if not allow_relaunch:
+                return "already_ended"
+            await _relaunch_from_results(page)
+            return "poll"
+        await _polls_back_to_list(page)
 
     row = await _find_poll_row(page, poll_name, is_prism=is_prism)
     kind = "poll"
@@ -2521,6 +2690,19 @@ async def _do_launch_poll_once(page, poll_name: str, is_prism: bool = False, on_
         raise PollNotAvailable(
             f"There is no Poll named '{poll_name}' in this meeting. {listing}. "
             f"Pick one of those in this row's Poll Select dropdown if one fits.", "Failed: not found")
+
+    # A poll that already ran shows "Ended" and a "View Results" button in the list - and no Launch button.
+    results_btn = await _poll_row_results_button(row)
+    if results_btn is not None:
+        if not allow_relaunch:
+            return "already_ended"
+        await _hover_click(page, results_btn)
+        for _ in range(16):
+            await asyncio.sleep(0.25)
+            if (await _polls_panel_state(page))[0] == "ended":
+                break
+        await _relaunch_from_results(page)
+        return kind
 
     await _click_launch_on_row(page, row)  # raises on failure/ambiguity
 
