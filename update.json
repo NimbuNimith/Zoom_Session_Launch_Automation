@@ -1,7 +1,7 @@
 {
   "version": "2.8.4",
   "runtime_id": "5d9f12a5a48572aebb564e0b8c61355e",
-  "notes": "2.8.4: poll launches are cut off after 90 s and retried until the session ends",
+  "notes": "2.8.4: fixed Zoom session start (Zoom sign-in no longer blocks sessions); poll launches are cut off after 90 s and retried until the session ends",
   "exe": {
     "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.8.4/Zoom_Ai_latest.exe",
     "sha256": "d4220c4f670935fad61c501a482179a3a0d84c4d6569fb3dc0c9b78ba6a822e2",
