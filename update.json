@@ -1,15 +1,15 @@
 {
-  "version": "1.0.0",
+  "version": "2.8.4",
   "runtime_id": "5d9f12a5a48572aebb564e0b8c61355e",
-  "notes": "2.7.4: file properties (version, product, company) now filled in",
+  "notes": "2.8.4: poll launches are cut off after 90 s and retried until the session ends",
   "exe": {
-    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.7.4/Zoom_Ai_latest.exe",
-    "sha256": "fde8285cfa18a49fd75f4657f140f4b204c36b840ea0cc52fe0d699c8f7dbf88",
-    "size": 12280877
+    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.8.4/Zoom_Ai_latest.exe",
+    "sha256": "d4220c4f670935fad61c501a482179a3a0d84c4d6569fb3dc0c9b78ba6a822e2",
+    "size": 12304386
   },
   "pack": {
-    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.7.4/CommandCenter_Pack_v2.7.4.zip",
-    "sha256": "57ffa348d43cd4bd0668335fe8ce60a3caac476a9bc3a9e6eb95f458ebe6c399",
-    "size": 96438769
+    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.8.4/CommandCenter_Pack_v2.8.4.zip",
+    "sha256": "df689d372017b273119fcfb9dc232ed8ea01bb4c216670d8ce1ddb97bd343cf3",
+    "size": 96461983
   }
 }
