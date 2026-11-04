@@ -38,7 +38,7 @@ from PySide6.QtGui import QKeySequence, QShortcut
 
 import theme
 from models import SessionModel, SessionTableModel, COL_INDEX
-from engine import Engine, DEFAULT_POLL_NAME, AUTO_POLL_END_MINUTES
+from engine import Engine, DEFAULT_POLL_NAME, AUTO_POLL_END_MINUTES, POLL_RETRY_AFTER_END_SECONDS
 from prism_data_pull import fetch_sessions_async
 from paths import resource_path
 from hard_exit import hard_exit
@@ -1953,7 +1953,9 @@ class MainWindow(QMainWindow):
                     self.log_event(
                         f"Auto-Pilot: launching '{poll_name}' for '{m.session_name}' "
                         f"({diff:.0f}m to end)", "info")
-                    self.engine.launch_poll(m.join_url, poll_name, auto=True)
+                    # keeps retrying until the session's end time + POLL_RETRY_AFTER_END_SECONDS
+                    self.engine.launch_poll(m.join_url, poll_name, auto=True,
+                                            retry_seconds=max(60.0, diff * 60 + POLL_RETRY_AFTER_END_SECONDS))
             except Exception:
                 pass
 
