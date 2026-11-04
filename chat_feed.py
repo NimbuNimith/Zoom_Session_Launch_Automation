@@ -63,6 +63,8 @@ _SKIP_LOG = re.compile(r"(\[POLL\] attempt|Update check|Blocked duplicate|Releas
                        r"Switched to|Desktop notifications|participant)", re.IGNORECASE)
 
 
+_GOOD_NEWS = "Internet is back to normal"     # network_watch.py's recovery line
+
 def webhook_ok(url: str) -> bool:
     return isinstance(url, str) and url.startswith(WEBHOOK_PREFIX) and "/messages" in url
 
@@ -117,6 +119,9 @@ def event_lines(events) -> list:
 
 def log_line(msg: str, level: str):
     """An Event Log entry -> a chat line, or None when it is not worth posting."""
+    if msg and level == "info" and msg.startswith(_GOOD_NEWS):
+        text = sanitize(msg)       # the one info line worth posting: the end of a "slow internet" warning
+        return ("✅ " + text) if text else None
     if level not in ("warn", "err") or not msg or msg.startswith(SELF_PREFIX) or _SKIP_LOG.search(msg):
         return None
     text = sanitize(msg)
