@@ -1207,11 +1207,16 @@ class MainWindow(QMainWindow):
         sid = m.prism_session_id
         if data.get("Entity") == "workshop":
             return "workshop-session", {"session_id": sid}
-        if m.prism_type == "session" and data.get("Entity") == "session":
+        if data.get("Entity") != "session":
+            return None
+        # Prism's own data decides the type (the sheet's Prism Type may be blank); the sheet's type is the fallback.
+        ptype = data.get("Inferred Type") or m.prism_type
+        if ptype == "session":
             return "session", {"session_id": sid}
-        if m.prism_type == "session-group-session" and data.get("Entity") == "session" and m.prism_session_group_id:
-            return "session-group-session", {"session_group_id": m.prism_session_group_id,
-                                             "session_group_session_id": sid}
+        gid = m.prism_session_group_id or data.get("Session Group ID") or ""     # the sheet's value wins; else Prism's
+        if ptype == "session-group-session" and gid:
+            m.prism_session_group_id = gid
+            return "session-group-session", {"session_group_id": gid, "session_group_session_id": sid}
         return None
 
     async def _try_auto_start_prism(self, m: SessionModel, data: dict) -> bool:
@@ -1550,8 +1555,8 @@ class MainWindow(QMainWindow):
         name = kw.get("session_name", "")
         if ptype not in VALID_PRISM_TYPES:
             self.log_event(
-                f"Prism row '{name}' has missing/unknown Prism Type ({ptype!r}) — launch "
-                f"will still work, but the live status-push to Prism will be skipped.", "warn")
+                f"Prism row '{name}' has a blank/unknown Prism Type ({ptype!r}) — fine: the app works it out "
+                f"from Prism using the Session ID.", "info")
         elif not psid:
             self.log_event(
                 f"Prism row '{name}' has no Session ID — launch will still work, but the "
@@ -1654,7 +1659,7 @@ class MainWindow(QMainWindow):
         m.start_time    = m.start_time or data.get("Starts At", "")
         m.end_time      = m.end_time or data.get("Ends At", "")
         m.meeting_code  = m.meeting_code or data.get("Meeting Code", "")
-        m.prism_type    = m.prism_type or data.get("Session Type", "")
+        m.prism_type    = m.prism_type or data.get("Session Type", "") or data.get("Inferred Type", "")
 
         if not self.table_model.rekey(url, real_url):
             self.log_event(

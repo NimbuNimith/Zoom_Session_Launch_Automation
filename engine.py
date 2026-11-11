@@ -1657,12 +1657,30 @@ class Engine:
             self.model.set_fields(url, prism_sync=f"❌ {reason}")
             self.log(f"Prism status push skipped ({reason}): {m.session_name}", "err")
 
-        if m.prism_type not in VALID_TYPES:
-            fail_permanent(f"invalid Prism Type {m.prism_type!r}"); return
         if not m.prism_session_id:
             fail_permanent("missing Session ID"); return
+        # Since 2.9.0 the sheet's Prism Type and Session Group ID columns are optional: Prism knows both.
+        if m.prism_type not in VALID_TYPES or (m.prism_type == "session-group-session" and not m.prism_session_group_id):
+            try:
+                from prism_data_pull import fetch_sessions_async
+                found = (await fetch_sessions_async([m.prism_session_id])).get(m.prism_session_id) or {}
+            except Exception as e:      # a failed lookup is transient: retried by the participant-scan loop, not final
+                self.model.set_fields(url, prism_sync=f"❌ {e}")
+                self.log(f"Prism: could not look up the type/group for '{m.session_name}' ({e}) - will retry in ~20s.", "warn")
+                return
+            if m.prism_type not in VALID_TYPES:
+                got = found.get("Session Type") or found.get("Inferred Type") or ""
+                if got in VALID_TYPES:
+                    m.prism_type = got
+                    self.log(f"Prism: '{m.session_name}' is a {got} (worked out from its Session ID).", "info")
+            if m.prism_type == "session-group-session" and not m.prism_session_group_id:
+                m.prism_session_group_id = found.get("Session Group ID") or ""
+                if m.prism_session_group_id:
+                    self.log(f"Prism: found the session group for '{m.session_name}' (looked up from its Session ID).", "info")
+        if m.prism_type not in VALID_TYPES:
+            fail_permanent(f"invalid Prism Type {m.prism_type!r}"); return
         if m.prism_type == "session-group-session" and not m.prism_session_group_id:
-            fail_permanent("missing Session Group ID"); return
+            fail_permanent("missing Session Group ID (Prism did not return one)"); return
 
         m.prism_status_pushed = True
         try:
