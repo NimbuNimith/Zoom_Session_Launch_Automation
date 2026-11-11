@@ -1,15 +1,15 @@
 {
-  "version": "2.8.4",
+  "version": "2.9.0",
   "runtime_id": "5d9f12a5a48572aebb564e0b8c61355e",
-  "notes": "2.8.4: fixed Zoom session start (Zoom sign-in no longer blocks sessions); poll launches are cut off after 90 s and retried until the session ends",
+  "notes": "2.9.0: Prism sessions start themselves in Prism without the sheet's Prism Type or Session Group ID (the app works them out from the Session ID); fixed Zoom session start; polls are retried until the session ends",
   "exe": {
-    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.8.4/Zoom_Ai_latest.exe",
-    "sha256": "d4220c4f670935fad61c501a482179a3a0d84c4d6569fb3dc0c9b78ba6a822e2",
-    "size": 12304386
+    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.9.0/Zoom_Ai_latest.exe",
+    "sha256": "bbf31b7fd727bceace9b8f5df21bace8d8817cf0f9253ce8bc5244184528a105",
+    "size": 12306223
   },
   "pack": {
-    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.8.4/CommandCenter_Pack_v2.8.4.zip",
-    "sha256": "df689d372017b273119fcfb9dc232ed8ea01bb4c216670d8ce1ddb97bd343cf3",
-    "size": 96461983
+    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.9.0/CommandCenter_Pack_v2.9.0.zip",
+    "sha256": "90eed96e340b3466b1dc8d7a5a5b7436f3f883094e55c1303a9477cb203fc999",
+    "size": 96463145
   }
 }
