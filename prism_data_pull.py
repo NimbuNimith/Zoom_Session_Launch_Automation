@@ -4,9 +4,10 @@ prism_data_pull.py
 Workflow: you maintain an Excel roster with a "Session ID" column filled in
 for each row (and a "Session Group ID" column for session-group-session
 rows — Prism's API doesn't return that ID, same as it doesn't for the
-group_session.py mutation, so it has to come from you). Run this script and
+group_session.py mutation). Run this script and
 it looks up each Session ID against Prism and writes the rest of the
-columns back into the SAME file:
+columns back into the SAME file (fetch_sessions also returns "Session Group ID", read from the
+session's sessionGroup - the app uses it so the sheet's group column can stay empty):
 
     Session Name, Starts At, Ends At, Status, Join URL, Start URL,
     Session Type, Meeting Code
@@ -55,6 +56,7 @@ query liveSessions($where: LiveSessionWhereInput, $sort: LiveSessionSortInput, $
         status
         startsAt
         endsAt
+        sessionGroup { id }
         virtualMeeting { code joinUrl startUrl virtualMeetingFor }
       }
       workshopSession {
@@ -69,6 +71,10 @@ query liveSessions($where: LiveSessionWhereInput, $sort: LiveSessionSortInput, $
   }
 }
 """
+
+# The same query without the group lookup: used when Prism rejects the sessionGroup field, so a change on
+# Prism's side can never break the launch/link lookups themselves.
+_QUERY_NO_GROUP = _QUERY.replace("        sessionGroup { id }\n", "")
 
 OUTPUT_COLUMNS = ["Session Name", "Starts At", "Ends At", "Status",
                    "Join URL", "Start URL", "Session Type", "Meeting Code"]
@@ -96,8 +102,29 @@ def fetch_sessions(session_ids):
     """Returns {session_id: {output columns...}} for every ID Prism recognized."""
     if not session_ids:
         return {}
+    try:
+        return _fetch_sessions(session_ids, _QUERY)
+    except RuntimeError as e:
+        if "sessionGroup" not in str(e):
+            raise
+        return _fetch_sessions(session_ids, _QUERY_NO_GROUP, with_group=False)     # Prism no longer offers the group lookup
+
+
+def infer_prism_type(entity: str, group_id: str) -> str:
+    """The status-call type from Prism's own data: a workshop is a workshop-session; a regular session that
+    belongs to a session group is a session-group-session; one without a group is a plain session.
+    Checked on ~3,000 Prism sessions (2026-11-11): all 948 with a group-session meeting have a group, all 202
+    with a plain-session meeting have none, all 80 workshop meetings are workshops - no exceptions."""
+    if entity == "workshop":
+        return "workshop-session"
+    if entity == "session":
+        return "session-group-session" if group_id else "session"
+    return ""
+
+
+def _fetch_sessions(session_ids, query, with_group=True):
     payload = {
-        "query": _QUERY,
+        "query": query,
         "variables": {
             "limit": len(session_ids),
             "skip": 0,
@@ -131,6 +158,8 @@ def fetch_sessions(session_ids):
         entity_id = entity.get("id")
         if not entity_id:
             continue
+        entity_kind = "workshop" if (ws and not s) else "session"
+        group_id = (s.get("sessionGroup") or {}).get("id", "") if s else ""
         by_id[entity_id] = {
             "Session Name": entity.get("name", ""),
             "Starts At":    entity.get("startsAt", ""),
@@ -140,8 +169,12 @@ def fetch_sessions(session_ids):
             "Start URL":    vm.get("startUrl", ""),
             "Session Type": vm.get("virtualMeetingFor", ""),
             "Meeting Code": vm.get("code", ""),
+            "Session Group ID": group_id,   # "" for workshops / plain sessions
+            # Known even before Prism has made the meeting (Session Type above is empty until then). Without the group
+            # lookup (fallback query) a regular session's kind is unknown, so only workshops are named.
+            "Inferred Type": infer_prism_type(entity_kind, group_id) if (with_group or entity_kind == "workshop") else "",
             "Has Meeting":  bool(vm),     # False: Prism returned the session with no meeting object at all
-            "Entity":       "workshop" if (ws and not s) else "session",
+            "Entity":       entity_kind,
         }
     return by_id
 
