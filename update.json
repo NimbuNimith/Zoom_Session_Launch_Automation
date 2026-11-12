@@ -1,15 +1,15 @@
 {
-  "version": "2.9.0",
+  "version": "2.9.1",
   "runtime_id": "5d9f12a5a48572aebb564e0b8c61355e",
-  "notes": "2.9.0: Prism sessions start themselves in Prism without the sheet's Prism Type or Session Group ID (the app works them out from the Session ID); fixed Zoom session start; polls are retried until the session ends",
+  "notes": "2.9.1: if Prism has not made a session's meeting, the app now starts it in Prism as soon as the 15-minute launch window opens and two link checks come back empty (was: 10 minutes before the start); includes 2.9.0 (Prism type and group worked out from the Session ID), fixed Zoom session start, polls retried until the session ends",
   "exe": {
-    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.9.0/Zoom_Ai_latest.exe",
-    "sha256": "bbf31b7fd727bceace9b8f5df21bace8d8817cf0f9253ce8bc5244184528a105",
-    "size": 12306223
+    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.9.1/Zoom_Ai_latest.exe",
+    "sha256": "48a0da44a8d7aa819b56fef2db55759dc2fefce1c5e664d1c0cc91a640633f0a",
+    "size": 12306385
   },
   "pack": {
-    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.9.0/CommandCenter_Pack_v2.9.0.zip",
-    "sha256": "90eed96e340b3466b1dc8d7a5a5b7436f3f883094e55c1303a9477cb203fc999",
-    "size": 96463145
+    "url": "https://github.com/NimbuNimith/Zoom_Session_Launch_Automation/releases/download/v2.9.1/CommandCenter_Pack_v2.9.1.zip",
+    "sha256": "04df12b11756e865b3c36460cef2725038a360814b1bc4215b5b972f883a1d71",
+    "size": 96464282
   }
 }
