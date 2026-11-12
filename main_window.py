@@ -1183,11 +1183,13 @@ class MainWindow(QMainWindow):
     # Prism's scheduler normally creates each session's Zoom meeting ~2 h before the start. When it
     # doesn't (24 Oct 2026), the meeting only appeared once someone pressed Start Now in Prism - which
     # is the same "status: started" call this app already makes after joining. So the app does that
-    # itself, but ONLY in the last 10 minutes before the start, only for a session that is still
+    # itself, but ONLY once the launch window is open (15 min before the start, the same moment Auto-Pilot
+    # begins launching) and the link has been missing on 2 checks in a row, only for a session that is still
     # yet-to-start and has no meeting at all. It is deliberately not a setting: moderators cannot turn
     # it on or off. PRISM_AUTO_START_ENABLED is the owner's switch, in code.
     PRISM_AUTO_START_ENABLED = True
-    PRISM_AUTO_START_WITHIN = 600           # seconds before the start; never earlier
+    PRISM_AUTO_START_WITHIN = 900           # seconds before the start (= Auto-Pilot's 15-minute launch window); never earlier
+    _PRISM_AUTO_START_AFTER_MISSES = 2      # link checks that must come back empty first
     _PRISM_AUTO_START_MAX_TRIES = 3
     _PRISM_AUTO_START_RETRY_AFTER = 30      # seconds between tries for one session
 
@@ -1231,6 +1233,11 @@ class MainWindow(QMainWindow):
             return False
         secs = self._seconds_to_start(data)
         if secs is None or not (0 <= secs <= self.PRISM_AUTO_START_WITHIN):
+            return False
+        # Two empty link checks inside the window first (a meeting can still show up on its own a moment later).
+        misses = self.__dict__.setdefault("_auto_start_misses", {})
+        misses[m.prism_session_id] = misses.get(m.prism_session_id, 0) + 1
+        if misses[m.prism_session_id] < self._PRISM_AUTO_START_AFTER_MISSES:
             return False
         target = self._auto_start_target(m, data)
         tries = self.__dict__.setdefault("_auto_start_tries", {})
@@ -1604,8 +1611,8 @@ class MainWindow(QMainWindow):
         else:
             if not urgent:
                 tail = ""
-            elif mins is not None and mins > 10 and self.PRISM_AUTO_START_ENABLED:
-                tail = " - the app will start it in Prism itself at 10 minutes before the start if it is still missing"
+            elif mins is not None and mins > 15 and self.PRISM_AUTO_START_ENABLED:
+                tail = " - the app will start it in Prism itself once it is 15 minutes before the start if it is still missing"
             else:
                 tail = " - if it stays like this, press Start Now for this session in Prism"
             self.log_event(
